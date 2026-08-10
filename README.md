@@ -11,6 +11,33 @@ Verified performance (star mission, 6 m radius, five 144° hairpin corners):
 **0.04 m mean / 0.10 m max cross-track, stops within 0.10 m of every
 vertex, zero overshoot** (run star137).
 
+![star137: planned vs flown, and altitude profile](examples/star137_topdown_altitude.png)
+
+That plot is run **star137**, the best flight this stack has produced, and
+it is worth reading closely because every hard-won fix is visible in it:
+
+- **The flown line (cyan) sits on the planned line (amber) so tightly they
+  read as one stroke** — max deviation 0.10 m over a 120 s mission. Earlier
+  in this project the same mission bowed its legs by 0.25 m and looped a
+  half-metre "cursive-l" at every point.
+- **The corners are points, not loops.** The vehicle brakes to a stop within
+  0.10 m of each star tip, is released the instant arrival is confirmed
+  (~1 s, not the 13 s "toilet-bowl" the old acceptance logic caused), and
+  accelerates straight out. Turn-direction errors — the left hook at
+  right-hand corners that took ~15 runs to isolate — are gone because
+  mission yaw holds AxisLock instead of sweeping mid-flight.
+- **The altitude trace (right) holds 8 m within ~0.3 m through every corner
+  transient**, with the grey waypoint-transition lines showing evenly-paced
+  legs — no stalls, no re-approaches.
+- It was flown by the **firmware's own estimator and path planner** on
+  injected sensors — not by the ground station steering from truth data.
+
+The complete evidence for this run — bridge ground-truth log, the FC's own
+on-board flight recorder, the (deliberately empty) Gazebo server log, and
+the three-log analysis that cross-checks them — ships in
+[`examples/`](examples/), so the claim above is reproducible, not a
+screenshot.
+
 ```
 OpenPilotAI/
 ├── README.md                  <- you are here

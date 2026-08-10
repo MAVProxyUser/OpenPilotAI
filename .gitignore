@@ -5,3 +5,7 @@ logs/
 *.png
 *.jsonl
 gui_plugins/WindControl/build/
+
+# examples/ ships real flight artifacts on purpose
+!examples/*.png
+!examples/*.jsonl
