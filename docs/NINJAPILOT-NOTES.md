@@ -244,6 +244,60 @@ sweep rather than taste: turn-tracking error bottoms out on a 0.5-0.8
 plateau while straight-line prediction keeps degrading above 0.5. Table in
 the source.
 
+### The miss is now ENTIRELY VERTICAL, and the budget is why (2026-08-10)
+
+With lag compensation in the estimator, the horizontal solution is
+essentially exact and the whole miss moved to one axis:
+
+    ekfA1   horiz 0.10m   vert -1.16m   (along-track -0.095, cross 0.034)
+    ekfA2   horiz 0.08m   vert -1.28m
+
+The FC's OWN log settles what kind of vertical failure it is: through the
+merge the vehicle tracked its commanded climb to within **0.10 m/s**, while
+that command decayed to **0.41-0.45 m/s with 1.16-1.28m still to close**.
+The airframe was never the limit - **guidance under-asks**.
+
+**Asking harder out of the same budget is NOT the fix, and is measured
+worse.** Raising the vertical cap to the time-matched rate `|vgap|/t_go`:
+
+    before  horiz 0.10 / 0.08   vert -1.16 / -1.28   sep 1.16 / 1.29
+    after   horiz 0.23 / 0.30   vert -1.41 / -1.51   sep 1.43 / 1.54
+
+Worse on BOTH axes, which is the tell. `vmax` is a **shared budget** - the
+horizontal term is `sqrt(vmax^2 - v_climb^2)` - so buying climb spends
+closure: 1.32 m/s of climb instead of 0.98 drops horizontal from 1.97 to
+1.76 m/s, the merge happens ~0.6s sooner, and the vehicle is therefore lower
+when it gets there. Reverted, documented in paths.c.
+
+The two directions that remain (neither tried): reach the target's altitude
+BEFORE committing horizontally (the `INTERCEPT_LEVEL_BAND` gate currently
+releases at 1.5m, which is most of the final miss), or give the vertical
+channel authority that does not come out of `vmax` at all. Note also that
+`INTERCEPT_AIM_HIGH_M` was tested and failed - but that was during the 9Hz
+loop era AND coupled with a gain change, so its verdict does not stand.
+
+### RULE: the three-log rule was NOT being enforced on intercept runs
+
+`run_intercept.sh` never set `NINJAPILOT_BRIDGE_LOG`, so `analyze_run.sh`
+printed "running board-log analysis only" on every single intercept - the
+flight controller's own account of itself, uncorroborated by ground truth.
+`run_gazebo_bridge.sh` also never redirected the Gazebo server's output, so
+the third log defaulted to a stale empty `/tmp/gzserver.log` for **star runs
+too**. Both fixed.
+
+`analyze_run.sh` now takes `NINJAPILOT_RUN_KIND`: score.py, wp_arrival.py,
+corner_probe.py and star_plot.py all grade against `star_geom.py` and would
+report confident nonsense on an intercept. `tools/intercept_three_log.py` is
+the intercept equivalent - and its first output was the vertical diagnosis
+above, which no amount of staring at bridge separation numbers had produced.
+
+Two traps found while building it, both the classic ones: the bridge track
+did not record the COMMANDED AIM POINT at all (so "planned vs flown" was
+undrawable for an intercept - the target's track is where the ball went, not
+what we asked for), and the first version of the vertical check scored
+post-break-off samples, where a commanded descent made a run that tracked
+perfectly report "did NOT track". Window on the engagement, always.
+
 ### RULE: validate filter changes OFFLINE first
 
 `tools/test_target_ekf.py` runs the filter against a synthetic truth track in
