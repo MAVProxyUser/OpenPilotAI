@@ -56,6 +56,16 @@
       name="gz::sim::systems::Sensors">
       <render_engine>ogre2</render_engine>
     </plugin>
+
+    <!-- Contact sensing must be a WORLD system, not a model plugin. Declared
+         on the model it loads silently and publishes nothing, which is how
+         the intercept test ended up detecting collisions by sampling the
+         distance between two objects at 20Hz - and aliasing straight over
+         them. Closing at ~2-3 m/s, consecutive samples are 10-15cm apart,
+         so a real strike (IMU peaked at 4.0g) can be recorded as a 0.58m
+         miss. This gives the physics engine's own verdict at full rate. -->
+    <plugin filename="gz-sim-contact-system"
+            name="gz::sim::systems::Contact"/>
     <plugin
       filename="gz-sim-imu-system"
       name="gz::sim::systems::Imu">
@@ -371,17 +381,21 @@
             each one above follows. Reordering the stack means editing both
             the order AND the anchor targets.
 
-         topic_picker is TRUE deliberately: with it false, gz-gui replaces
-         the picker with a permanent "Subscribed to: <topic>" banner that
-         eats most of a small panel (that string is baked into
-         libImageDisplay.dylib; there is no separate switch for it).
+         These use our own CameraView plugin, not gz-gui's ImageDisplay.
+         ImageDisplay renders a permanent "Subscribed to: <topic>" banner
+         whose string is compiled into libImageDisplay.dylib's QML resource
+         - there is no config key to hide it, and topic_picker only swaps it
+         for a topic combo box, which is just different chrome. On a 300x225
+         panel that banner takes a third of the view, three times over.
+         CameraView draws the image and nothing else. Build it with the
+         wind/GPS panels: gui_plugins/WindControl.
 
          The cameras DO render. An earlier note here claimed they were
          blank on macOS - that was measured with the server running ALONE.
          `gz sim -s` only renders once a GUI client has brought up a
          context; with both up, frames carry real scene content. -->
 
-    <plugin filename="ImageDisplay" name="Down">
+    <plugin filename="CameraView" name="Down">
       <gz-gui>
         <title>Down</title>
         <property type="bool" key="showTitleBar">true</property>
@@ -395,10 +409,9 @@
         </anchors>
       </gz-gui>
       <topic>/X3/cam_down/image</topic>
-      <topic_picker>true</topic_picker>
     </plugin>
 
-    <plugin filename="ImageDisplay" name="FPV 45deg">
+    <plugin filename="CameraView" name="FPV 45deg">
       <gz-gui>
         <title>FPV 45deg</title>
         <property type="bool" key="showTitleBar">true</property>
@@ -412,10 +425,9 @@
         </anchors>
       </gz-gui>
       <topic>/X3/cam_fpv45/image</topic>
-      <topic_picker>true</topic_picker>
     </plugin>
 
-    <plugin filename="ImageDisplay" name="Up">
+    <plugin filename="CameraView" name="Up">
       <gz-gui>
         <title>Up</title>
         <property type="bool" key="showTitleBar">true</property>
@@ -429,7 +441,6 @@
         </anchors>
       </gz-gui>
       <topic>/X3/cam_up/image</topic>
-      <topic_picker>true</topic_picker>
     </plugin>
 
     </gui>
@@ -462,8 +473,13 @@
     <scene>
       <ambient>0.6 0.6 0.6 1</ambient>
       <background>0.55 0.72 0.92 1</background>
-      <sky></sky>
       <shadows>true</shadows>
+      <!-- NO <sky> HERE, deliberately. gz-sim's procedural sky brings its own
+           sun, and this world already declares a directional light named
+           "sun" - with both present the sky's sun animates and every shadow
+           in the scene sweeps around the property as it moves. The blue
+           <background> gives camera frames a sky-coloured field (the actual
+           complaint that started this) without a second light source. -->
     </scene>
 
     <!-- Grass to the horizon, so the farm reads as the centrepiece of a
