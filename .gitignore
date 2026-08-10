@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+logs/
+*.png
+*.jsonl
+gui_plugins/WindControl/build/
