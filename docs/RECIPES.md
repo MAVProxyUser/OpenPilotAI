@@ -448,6 +448,84 @@ To publish wind without the GUI (speed v m/s FROM bearing B):
 `linear_velocity.x = -v*sin(B)`, `.y = -v*cos(B)`, and `enable_wind: true`
 or WindEffects applies nothing. Links need `<enable_wind>` to be pushed.
 
+## Intercept: run it, score it, tune it (2026-08-10)
+
+`run_intercept.sh` is the ONLY supported way, same reason as run_star.sh. It
+kills and waits, removes any stale target BOTH before and after the world
+reset, purges slots, flies, analyses all three logs, and plots.
+
+```bash
+cd ground/gazebo_bridge
+./run_intercept.sh icpt01
+```
+
+If it aborts with `target_ball STILL present after reset`, restart the
+Gazebo server - a knocked-down ball occasionally survives both the remove
+service and the reset, and every run after it fails to spawn.
+
+Batch several runs, reporting the miss decomposed (which is the only useful
+form - a scalar separation hides whether the error is horizontal or vertical):
+
+```bash
+for r in a1 a2 a3; do NINJAPILOT_VISION=0 ./run_intercept.sh $r; done
+```
+
+Env knobs, no rebuild needed:
+
+| var | default | what it does |
+|---|---|---|
+| `NINJAPILOT_VISION` | 1 | 0 disables the camera bearing channel (EKF then runs on position only) |
+| `NINJAPILOT_LAG_S` | 0.48 | seconds the EKF predicts ahead; 0 = no lag compensation |
+| `NINJAPILOT_TRAILS` | 1 | 0 drops the marker trails for faster batches |
+| `TARGET_SPEED` | 1.2 | target m/s |
+
+### Settled intercept values
+
+Ten consecutive first-pass contacts, 0.45-0.58m against 0.582m geometry.
+
+| knob | value | note |
+|---|---|---|
+| `INTERCEPT_LEVEL_BAND` | 0.10 m | **the load-bearing one.** Climb to level BEFORE committing horizontally. 1.5 -> 0.10 took the miss 1.2m -> 0.5m |
+| `INTERCEPT_SPEED` | 2.6 m/s | 3.0 is unstable without retuning HorizontalVelPID |
+| `TRACK_LAG_S` | 0.48 s | EKF forward prediction; replaced a firmware constant that made things WORSE |
+| `INTERCEPT_AIM_HIGH_M` | 0.0 | tested twice, buys nothing - see the shared-budget note |
+| `INTERCEPT_CLIMB_FRAC` | 0.6 | 0.9 is worse and noisier |
+
+**Do not spend runs re-splitting the error budget.** Horizontal and vertical
+trade ~1:1 and their sum is conserved near 0.5m because `vmax` is shared
+(`horizontal = sqrt(vmax^2 - v_climb^2)`). More capability or more time is
+the only way below that floor.
+
+## Validate estimator/filter changes OFFLINE before flying them
+
+```bash
+./venv/bin/python3 tools/test_target_ekf.py
+```
+
+0.2s instead of a 90s flight. Checks convergence, that bearing updates
+cannot corrupt range (the rank-2 Jacobian property), and that
+`predict_ahead(tau)` lands on truth tau seconds later. Several guidance
+constants that cost multiple flights each could have been rejected here.
+
+## Three-log analysis for an intercept run
+
+`analyze_run.sh` branches on `NINJAPILOT_RUN_KIND` because score.py /
+wp_arrival.py / star_plot.py all grade against the star geometry and report
+confident nonsense on an intercept. `run_intercept.sh` sets it. Manually:
+
+```bash
+NINJAPILOT_RUN_KIND=intercept tools/analyze_run.sh icpt01 "$TMPDIR/icpt01.log"
+# or just the intercept-specific comparison:
+./venv/bin/python3 tools/intercept_three_log.py \
+    "$TMPDIR/icpt01_flash.jsonl" "$TMPDIR/icpt01_track.json"
+```
+
+The one output that matters most: **"vehicle TRACKED the vertical command"
+vs "did NOT track"**. Those are opposite fixes - the first is a guidance
+bug, the second is thrust/tilt starvation - and no separation number
+distinguishes them. It is what identified the vertical miss as guidance
+under-asking rather than an airframe limit.
+
 ## Star mission: current settled values (2026-08-09, corner saga closed)
 
 Best verified: **star136 - cross-track 0.05m mean / 0.12m MAX, zero

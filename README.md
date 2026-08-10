@@ -252,6 +252,21 @@ produced confident wrong conclusions (documented cases in the docs).
 | `star_plot.py` | the top-down planned-vs-flown picture + altitude profile |
 | `porpoise.py` | oscillation frequency/amplitude per axis |
 | `star_geom.py` | single source of truth for the mission geometry (all tools import it) |
+| `intercept_three_log.py` | intercept equivalent of `score.py`: did the vehicle **track** its vertical command, or fail to? |
+| `intercept_plot.py` | both tracks, altitude, separation + the IMU trace |
+| `intercept_summary.py` | hit rate across runs, each miss split horizontal/vertical |
+| `test_target_ekf.py` | offline filter checks in 0.2 s — run before flying a filter change |
+
+`analyze_run.sh` branches on `NINJAPILOT_RUN_KIND`: `score.py`,
+`wp_arrival.py`, `corner_probe.py` and `star_plot.py` all grade against the
+star geometry, so pointing them at an intercept reports confident nonsense.
+`run_intercept.sh` sets the kind for you.
+
+The single most useful line in the intercept analysis is **"vehicle TRACKED
+the vertical command"** vs **"did NOT track"**. Those imply opposite fixes —
+a guidance bug versus thrust/tilt starvation — and no separation number tells
+them apart. It is what proved the vertical miss was guidance under-asking
+rather than an airframe limit.
 
 ### FPV camera array (down / up / 45deg forward)
 Three cameras on `X3/base_link`, added as sensors on the existing link so
@@ -277,6 +292,79 @@ the GUI looked right.
 `run_gazebo_bridge.sh` passes `--headless-rendering` to the **server**
 (not the GUI) so camera sensors don't open a stray visible render window
 on macOS.
+
+### Intercept flight mode — hitting a moving target
+
+A firmware flight mode (`PATHDESIRED_MODE_INTERCEPT` → `path_intercept()` in
+`flight/libraries/paths.c`) that flies a lead solution onto a moving object
+and makes contact. The bridge scrambles on detection — no hover time — and
+the object reacts physically to being struck.
+
+**Division of labour, deliberately:** the bridge supplies only the target's
+position and velocity, which is all an external tracker or second GPS could
+give you. Every bit of guidance runs in firmware, at follower rate rather
+than telemetry rate.
+
+```bash
+cd ground/gazebo_bridge && ./run_intercept.sh icpt01
+```
+
+Current state: **ten consecutive first-pass contacts**, zero aborts, zero
+stern chases, closest approach 0.45–0.58 m against a 0.582 m contact
+geometry (ball radius + the frame's half-*diagonal*, not half-width).
+
+The two findings that produced almost all of it:
+
+- **The endgame miss was pure LAG, not aim.** It was a repeatable 0.57–0.59 m
+  directly *behind* the ball with ~0.15 m cross-track — 0.48 s of latency
+  through the loop, transport, and the ~130 ms attitude response. Adding that
+  as a constant to the guidance lead made it *worse* (1.25–1.32 m), because
+  the lead is already range-dependent. Moving the compensation into the
+  estimator fixed it: along-track error 0.58 → 0.095 m.
+- **The rest was the climb-first gate.** With lag gone the entire remaining
+  miss was vertical. `INTERCEPT_LEVEL_BAND` 1.5 → 0.10 m keeps horizontal
+  throttled until the vehicle is nearly level, so the endgame never buys
+  altitude out of the closure budget: 1.2 m → 0.5 m.
+
+**Known ceiling, and why it is a ceiling.** Horizontal and vertical error
+trade roughly 1:1 and their sum is conserved near 0.5 m, because `vmax` is a
+shared budget (`horizontal = sqrt(vmax² − v_climb²)`). Three attempts to
+improve the split — a time-matched vertical cap, a 0.35 m aim-high bias, and
+a larger climb fraction — all failed for that one reason and are documented
+in place. Only more capability or more time gets below it.
+
+### Target tracking: an EKF fusing camera bearings with position
+
+`ground/gazebo_bridge/tools/target_ekf.py` — a 6-state constant-velocity EKF
+on the target, replacing the raw finite-difference velocity previously handed
+to the firmware, and owning lag compensation.
+
+**Vision is fused, not substituted.** The first attempt rotated the target
+direction onto the measured camera bearing and kept the last-known range,
+and *lost* to no vision at all (0.41–1.03 m closest approach off, 1.03–2.35 m
+on). Two independent causes, both fixed:
+
+- It discarded range. The bearing update's Jacobian `(I − uuᵀ)/|R|` is a
+  rank-2 projector whose null space is the sightline itself, so a camera can
+  only move the estimate *perpendicular* to the LOS — it sharpens direction
+  and is structurally incapable of corrupting range. No gate or heuristic
+  enforces this; it falls out of the geometry.
+- It cost loop rate. Two 640×480 30 Hz RGB subscriptions push ~55 MB/s into
+  the process that feeds sensors to the firmware. Dedicated 160×120 20 Hz
+  tracker cameras cut that 24× to 2.3 MB/s; the 640×480 feeds are untouched
+  and still serve the FPV widgets, which render in the Gazebo GUI process.
+
+Per the operator's policy, vision contributes **only while the ball is
+actually in frame** — and because it is fused rather than switched, dropout
+is not a handoff: the filter simply stops receiving bearings and coasts on
+the position channel, with its covariance recording the cost.
+
+**Validate filter changes offline first** — `tools/test_target_ekf.py` runs
+against a synthetic truth track in 0.2 s and checks convergence, the
+range-immunity property, and that `predict_ahead(τ)` lands on truth τ seconds
+later (0.199 m at the real 0.48 s lag, vs the 0.58 m of raw lag it replaces).
+Several guidance constants that each cost a flight to reject could have been
+rejected here.
 
 ### Gazebo environment
 - **Farm world**: Clearpath Robotics' `cpr_agriculture` scene ported from
@@ -326,3 +414,14 @@ applied wholesale.
 - The sim GPS is idealized-ublox-grade injected post-parser; a real-UBX
   byte-stream path into the firmware's GPS port is designed but
   deliberately not started.
+- **Intercept: contacts are not yet confirmed *strikes*.** All ten first-pass
+  runs satisfy the distance criterion, but only one registered a collision on
+  the physics engine (`felt=True`). Closing at 2–5 m/s, 20 Hz sampling steps
+  over the contact; the ball's contact sensor is the ground truth to trust.
+- **Vision's in-flight contribution is unmeasured.** The pipeline is wired
+  and validated offline, but every one of the ten scoring runs was flown with
+  `NINJAPILOT_VISION=0` to isolate the geometry. The A/B still owes a number.
+- **Intercept speed is capped by the velocity loop**, not the airframe:
+  `INTERCEPT_SPEED` 2.6 m/s flies clean, 3.0 is unstable without retuning
+  `HorizontalVelPID` first. That retune is the next real lever, since the
+  error budget above is capability-limited rather than tuning-limited.

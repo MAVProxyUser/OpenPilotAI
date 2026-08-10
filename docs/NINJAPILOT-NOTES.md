@@ -269,12 +269,47 @@ closure: 1.32 m/s of climb instead of 0.98 drops horizontal from 1.97 to
 1.76 m/s, the merge happens ~0.6s sooner, and the vehicle is therefore lower
 when it gets there. Reverted, documented in paths.c.
 
-The two directions that remain (neither tried): reach the target's altitude
-BEFORE committing horizontally (the `INTERCEPT_LEVEL_BAND` gate currently
-releases at 1.5m, which is most of the final miss), or give the vertical
-channel authority that does not come out of `vmax` at all. Note also that
-`INTERCEPT_AIM_HIGH_M` was tested and failed - but that was during the 9Hz
-loop era AND coupled with a gain change, so its verdict does not stand.
+**RESOLVED by the climb-first gate, not by the vertical law.**
+`INTERCEPT_LEVEL_BAND` 1.5 -> 0.10 keeps horizontal throttled until the
+vehicle is nearly level with the target, so the endgame never has to buy
+altitude out of the closure budget at all:
+
+    band 1.5   horiz 0.10 / 0.08   vert -1.16 / -1.28   sep 1.16 / 1.29
+    band 0.35  horiz 0.09-0.14     vert -0.69..-0.78    sep 0.70-0.79
+    band 0.10  horiz 0.35-0.43     vert -0.31..-0.41    sep 0.46-0.54
+
+With `INTERCEPT_SPEED` 2.2 -> 2.6 (stable; only 3.0 was ever unstable), TEN
+consecutive runs made contact on the FIRST pass - zero aborts, zero stern
+chases, 0.45-0.58m against the 0.582m contact geometry.
+
+### The error budget is CONSERVED - this is the ceiling, and the reason
+
+Three separate attempts to improve on that all failed the same way:
+
+    vertical cap = time-matched rate   worse on BOTH axes
+    INTERCEPT_AIM_HIGH_M 0.35          vert -0.31 -> -0.10, horiz 0.40 -> 0.48
+    INTERCEPT_CLIMB_FRAC 0.6 -> 0.9    worse and noisier (0.45-0.63)
+
+Horizontal and vertical error trade **roughly 1:1**, and their sum sits near
+0.5m regardless of how the split is chosen, because `vmax` is a SHARED
+BUDGET - the horizontal term is `sqrt(vmax^2 - v_climb^2)`. Re-dividing that
+budget cannot get below the floor; only more capability or more time can.
+That makes the flight-envelope work (tilt/rate/speed maxima) the next real
+lever, not further guidance tuning. Do not spend more runs re-splitting.
+
+Note `INTERCEPT_AIM_HIGH_M` has now been tested TWICE: once in the 9Hz era
+coupled with a gain change (invalid), and once cleanly here. The clean test
+says it works exactly as intended on the vertical axis and buys nothing
+overall, for the budget reason above.
+
+### The stale target costs whole runs - re-check AFTER the reset
+
+A knocked-down ball survived both the `/world/quadcopter/remove` service AND
+the world reset. `run_intercept.sh` removed it only BEFORE the reset, so the
+next two runs died on "could not spawn target" - the exact icpt07 failure
+that script exists to prevent, recurring because the check was on the wrong
+side of the reset. It now re-checks afterwards and aborts loudly with the
+remedy (restart the Gazebo server) rather than flying a doomed run.
 
 ### RULE: the three-log rule was NOT being enforced on intercept runs
 
