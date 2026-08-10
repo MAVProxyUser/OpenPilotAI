@@ -41,21 +41,24 @@ screenshot.
 ```
 OpenPilotAI/
 ├── README.md                  <- you are here
+├── flight/                    the FULL firmware source: SimPosix target,
+│                              posix PIOS layer, FreeRTOS V11.3.0 kernel,
+│                              all modules incl. the resurrected Autotune
+├── make/ package/ Makefile    the firmware build system
 ├── ground/
 │   ├── gazebo_bridge/         the bridge, harness, worlds, models, tools
-│   └── pyuavtalk/             minimal Python UAVTalk/UAVObjects client
-├── shared/uavobjectdefinition/  UAVObject XMLs (pyuavtalk parses these)
-├── flight-reference/          the firmware files this work modified (READ
-│                              ONLY - excerpts of the fork, not buildable)
+│   ├── pyuavtalk/             minimal Python UAVTalk/UAVObjects client
+│   └── uavobjgenerator/       UAVObject code generator (built by make)
+├── shared/                    UAVObject XMLs + version info templates
+├── examples/                  a complete real flight: photo + all three logs
 └── docs/
     ├── PROJECT-NOTES.md       hard-won findings, mechanisms, dead ends
     └── RECIPES.md             operational recipes and idioms
 ```
 
-The ground side here is self-contained (the XML catalog and mission
-geometry load from this tree). The **firmware** builds from the full
-`NinjaPilot-15.02.ninja` fork, which lives alongside this folder; the files
-under `flight-reference/` show exactly what was changed there.
+This repo is **fully self-contained**: the ground stack runs from it and
+the firmware builds from it (verified: a clean `make simposix` from a fresh
+copy of this tree produces `fw_simposix.elf`).
 
 ---
 
@@ -80,13 +83,13 @@ python3.13 -m venv --system-site-packages venv
 ./venv/bin/python3 -c "import gz.transport13; print('gz bindings OK')"
 ```
 
-### 2. Firmware (from the NinjaPilot fork)
+### 2. Firmware (builds from THIS repo)
 
-The repo tree does not build in place; it is rsynced to a build directory
-first (see docs/RECIPES.md "Build (simposix)"):
+Build in a separate directory (keeps artifacts out of the source tree; the
+version stamp wants the `.git` present, so rsync *with* it):
 
 ```bash
-rsync -a NinjaPilot-15.02.ninja/ ~/ninjapilot-build/
+rsync -a OpenPilotAI/ ~/ninjapilot-build/
 cd ~/ninjapilot-build && make -j8 ARM_SDK_PREFIX=arm-none-eabi- simposix
 mkdir -p ~/ninjapilot-build/fcwd
 ```
@@ -260,7 +263,7 @@ Its measurements (roll 113 ms / pitch 155 ms / yaw 560 ms ultimate periods)
 anchor several tuning decisions; its ZN gain recipe is deliberately not
 applied wholesale.
 
-### Firmware-side changes (see `flight-reference/`, full history in the fork)
+### Firmware-side changes (all included under `flight/`; key files below)
 - `paths.c`: trapezoidal leg speed profile with separate accel/decel, linear
   arrival taper (with a floor so full-stop corners still close), leg cruise
   from `ModeParameters[1]`, past-endpoint fallback so a missed sphere can't
