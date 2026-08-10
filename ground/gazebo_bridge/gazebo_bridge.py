@@ -138,7 +138,15 @@ INTERCEPT_SPEED    = 2.6    # m/s cap handed to the firmware (EndingVelocity)
 # range: the firmware is handed where the target will be when the command
 # actually bites. Offline this predicts to 0.199m against 0.58m of raw lag
 # (tools/test_target_ekf.py check 3).
-TRACK_LAG_S        = float(os.environ.get("NINJAPILOT_LAG_S", "0.48"))
+# 0.48 -> 0.20. The 0.48s was measured with detection at 34m, where the
+# engagement was short and the vehicle still settling at the merge. With
+# DETECT_RANGE 46 the run is longer and better settled, the real loop lag is
+# smaller, and 0.48 OVER-leads: the miss flipped sign to +0.38m AHEAD of the
+# ball (0.32s of over-lead at 1.2 m/s). 0.20 cancels it - 4/4 confirmed
+# strikes. Lag compensation is not a constant of the vehicle; it is a
+# property of the vehicle AND the engagement, so re-measure it whenever the
+# geometry changes. NINJAPILOT_LAG_S overrides without a rebuild.
+TRACK_LAG_S        = float(os.environ.get("NINJAPILOT_LAG_S", "0.20"))
 TRACK_VISION       = os.environ.get("NINJAPILOT_VISION", "1") == "1"
 # Contact happens at up to ball radius + the frame's half-DIAGONAL, not its
 # half-width: the box is 0.47x0.47, so corner-on contact occurs at
@@ -146,7 +154,21 @@ TRACK_VISION       = os.environ.get("NINJAPILOT_VISION", "1") == "1"
 # derived from the half-width (0.235) and scored a real collision as a miss -
 # icpt04 bottomed out at 0.577m with a 4.0g impulse and its closing speed
 # collapsing 3.15 -> 0.98 m/s, which is a strike by any reading.
-INTERCEPT_HIT_DIST = 0.60   # m centre-to-centre = contact
+#
+# 0.60 -> 0.485: SCORE ONLY WHAT IS GEOMETRICALLY GUARANTEED.
+#
+# 0.582 is the corner-on MAXIMUM; face-on contact needs 0.25 + 0.235 = 0.485.
+# Between those two the outcome depends entirely on relative orientation at
+# the merge, so a distance backstop set at 0.60 counted the whole ambiguous
+# band - and worse, counted 0.02m of clearance past even the corner-on case -
+# as a hit. That is exactly what the run record showed: ten first-pass
+# "intercepts" at 0.45-0.58m, of which the physics engine registered ONE.
+#
+# The backstop now sits at the distance where contact cannot NOT happen. A
+# real collision at 0.50-0.58m still scores, because `real_contact` from the
+# ball's own contact sensor is checked first and is the actual ground truth;
+# the backstop exists only to catch a strike the 20Hz sampler stepped over.
+INTERCEPT_HIT_DIST = 0.485  # m centre-to-centre: guaranteed-contact distance
 # Hover sits at 1.00g and the 90th percentile through a whole intercept run
 # is 1.06g, so anything above ~1.5 is not flight - measured, not guessed.
 IMU_HIT_G          = 2.0    # g total accel: the IMU-side collision trigger
@@ -171,9 +193,19 @@ BARN_AT            = (20.0, 20.0)   # N, E: where the object strikes the farm
 TRAILS_ON          = os.environ.get("NINJAPILOT_TRAILS", "1") == "1"
 FLYAWAY_RANGE_M    = 22.0   # m from pad: past this and opening, break off
 ENGAGE_TIMEOUT_S   = 14.0   # s of active pursuit before breaking off
-DETECT_RANGE       = 34.0   # m: range at which the object is "seen" and the
-                            # vehicle scrambles. Wide enough that a 1.2 m/s
-                            # target leaves time to launch and climb 11m.
+# 34 -> 46: BUY TIME, because time is the only thing that helps.
+#
+# Horizontal and vertical error trade ~1:1 and their sum is conserved near
+# 0.5m, because vmax is a shared budget (horizontal = sqrt(vmax^2-v_climb^2)).
+# Three attempts to re-split it - a time-matched vertical cap, an aim-high
+# bias, a bigger climb fraction - all failed for that one reason. The budget
+# is spent climbing 10.2m AND closing ~25m inside ~6s; the only escapes are
+# more speed (2.6 flies, 3.0 is unstable without retuning HorizontalVelPID)
+# or more time. Detecting earlier is the honest version of more time: a real
+# cueing sensor has range, and the target spawns ~48m out, so 46m cues almost
+# at spawn and hands the whole extra span to the climb.
+DETECT_RANGE       = 46.0   # m: range at which the object is "seen" and the
+                            # vehicle scrambles.
 TARGET_TURN_AT     = float(os.environ.get("NINJAPILOT_TURN_AT", "5.0"))
 TARGET_TURN_DEG    = float(os.environ.get("NINJAPILOT_TURN_DEG", "55.0"))
 
@@ -3003,6 +3035,15 @@ def gui_follow(node, model=GAZEBO_MODEL, offset=(-14.0, -14.0, 9.0)):
     from gz.msgs10.boolean_pb2 import Boolean
     from gz.msgs10.vector3d_pb2 import Vector3d
     try:
+        # FOLLOW IS OPT-IN. Chasing the vehicle zooms the view onto it, which
+        # makes a 50m engagement impossible to watch - you see the quad and
+        # nothing it is chasing. Default off; the world's camera_pose gives a
+        # whole-farm overview with the barn at the top of the frame instead.
+        # NINJAPILOT_FOLLOW=1 restores the chase view.
+        if os.environ.get("NINJAPILOT_FOLLOW", "0") != "1":
+            print("[gui] camera follow OFF (whole-farm overview); "
+                  "NINJAPILOT_FOLLOW=1 to chase the vehicle")
+            return
         s = StringMsg()
         s.data = model
         node.request("/gui/follow", s, StringMsg, Boolean, 1000)
