@@ -49,7 +49,15 @@ sleep 6
 # function returns - client.run() keeps pumping packets forever - so waiting
 # on the process in the foreground hangs the whole batch. It did: icpt05
 # finished, its bridge stayed up for 82 minutes, and icpt06/07 never started.
+# THREE LOGS, exactly as run_star.sh does it - see the rule at the top of
+# CLAUDE.md. NINJAPILOT_BRIDGE_LOG is what upgrades analyze_run.sh from
+# "board-log analysis only" to the full cross-comparison; without it the run
+# is judged on the FC's own account of itself, which is precisely the failure
+# this project has repeated. GZLOG is the Gazebo server's stderr, the third
+# log - it says whether the simulator itself was unhappy.
 NINJAPILOT_TEST_MODE=intercept NINJAPILOT_RUN_LABEL="$LABEL" \
+  NINJAPILOT_BRIDGE_LOG="$LOG" NINJAPILOT_RUN_KIND=intercept \
+  GZLOG="${GZLOG:-${TMPDIR:-/tmp}/gzserver.log}" \
   "$BR/venv/bin/python3" "$BR/gazebo_bridge.py" > "$LOG" 2>&1 &
 BRIDGE_PID=$!
 
