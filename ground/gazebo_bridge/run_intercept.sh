@@ -39,6 +39,26 @@ gz model --list 2>/dev/null | grep -q target_ball && \
 "$BR/venv/bin/python3" "$BR/tools/reset_world.py" >/dev/null 2>&1
 sleep 1
 
+# RE-CHECK AFTER THE RESET, not just before it. A knocked-down ball survives
+# both the remove service and the reset often enough to matter: lc1 scored a
+# hit, and lc2 AND lc3 were then lost to "could not spawn target" - two runs
+# thrown away by one stale entity, which is exactly the icpt07 failure this
+# script was written to prevent. Removing before the reset is not sufficient,
+# because the reset itself can put the entity back into a state where the
+# next spawn collides with it.
+for _ in $(seq 1 8); do
+    gz model --list 2>/dev/null | grep -q target_ball || break
+    gz service -s /world/quadcopter/remove --reqtype gz.msgs.Entity \
+      --reptype gz.msgs.Boolean --timeout 2000 \
+      --req 'name: "target_ball", type: MODEL' >/dev/null 2>&1
+    sleep 1
+done
+if gz model --list 2>/dev/null | grep -q target_ball; then
+    echo "!!! target_ball STILL present after reset - this run will fail to spawn."
+    echo "!!! restart the Gazebo server (run_gazebo_bridge.sh) before continuing."
+    exit 1
+fi
+
 rm -f ~/ninjapilot-build/fcwd/233CDC*.o* 2>/dev/null
 ( cd ~/ninjapilot-build/fcwd && NINJAPILOT_EXTERNAL_PHYSICS=1 \
     ~/ninjapilot-build/build/fw_simposix/fw_simposix.elf > "$SCRATCH/${LABEL}_fw.log" 2>&1 & )

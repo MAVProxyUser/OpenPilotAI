@@ -523,7 +523,7 @@ static void path_circle(PathDesiredData *path, float *cur_point, struct path_sta
 #define INTERCEPT_ENDGAME_MAX_LEAD_S 2.5f  // s: cap on the endgame lead
                                            // horizon, so a stalled closure
                                            // cannot aim absurdly far ahead
-#define INTERCEPT_LEVEL_BAND     1.5f   // m: within this of the target's
+#define INTERCEPT_LEVEL_BAND     0.10f   // m: within this of the target's
                                         // altitude counts as level - full
                                         // horizontal pursuit
 #define INTERCEPT_LEVEL_RAMP     5.0f   // m: ramp horizontal back in over

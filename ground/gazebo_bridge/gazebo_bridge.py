@@ -123,7 +123,7 @@ TARGET_END         = (34.0, 34.0)     # N, E: the opposite corner, via overhead
 # 3.0 CRASHED (spd01) - the velocity loop is tuned at 1.5 m/s and goes
 # unstable at 3.0. Raw speed is not available without retuning
 # HorizontalVelPID first. Back to 2.2, which flies.
-INTERCEPT_SPEED    = 2.2    # m/s cap handed to the firmware (EndingVelocity)
+INTERCEPT_SPEED    = 2.6    # m/s cap handed to the firmware (EndingVelocity)
 # LAG COMPENSATION, owned by the estimator rather than by the guidance law.
 #
 # The clean-baseline miss was a repeatable 0.57-0.59m directly BEHIND the
