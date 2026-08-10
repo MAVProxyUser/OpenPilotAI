@@ -67,12 +67,20 @@ copy of this tree produces `fw_simposix.elf`).
 ### Prerequisites (macOS / Homebrew)
 
 ```bash
-brew install gz-harmonic python@3.13
+xcode-select --install          # host compiler + make (if not present)
+brew install gz-harmonic python@3.13 qt
 ```
 
-`gz-harmonic` installs Gazebo and its Python bindings (`gz.transport13`,
-`gz.msgs10`) into Homebrew's site-packages — which is why the venv below
-must be created **with `--system-site-packages`**.
+- `gz-harmonic` installs Gazebo and its Python bindings (`gz.transport13`,
+  `gz.msgs10`) into Homebrew's site-packages — which is why the venv below
+  must be created **with `--system-site-packages`**.
+- `qt` provides `qmake`, which the firmware build uses once to build the
+  UAVObject code generator (verified working with Qt 6). The optional
+  wind/GPS gz-gui panels additionally want `qt@5` (gz-gui is Qt5-based).
+- No ARM cross-toolchain is needed for SITL: the simposix target overrides
+  the ARM prefix and compiles with the host compiler. (An
+  `arm-none-eabi-` toolchain is only needed to build the real-hardware
+  targets like `fw_revolution`.)
 
 ### 1. Python environment
 
@@ -90,7 +98,7 @@ version stamp wants the `.git` present, so rsync *with* it):
 
 ```bash
 rsync -a OpenPilotAI/ ~/ninjapilot-build/
-cd ~/ninjapilot-build && make -j8 ARM_SDK_PREFIX=arm-none-eabi- simposix
+cd ~/ninjapilot-build && make -j8 simposix
 mkdir -p ~/ninjapilot-build/fcwd
 ```
 
