@@ -253,6 +253,31 @@ produced confident wrong conclusions (documented cases in the docs).
 | `porpoise.py` | oscillation frequency/amplitude per axis |
 | `star_geom.py` | single source of truth for the mission geometry (all tools import it) |
 
+### FPV camera array (down / up / 45deg forward)
+Three cameras on `X3/base_link`, added as sensors on the existing link so
+mass, inertia and therefore all flight tuning are unchanged:
+
+| camera | aim | FOV / rate | purpose |
+|---|---|---|---|
+| `cam_down` | straight down | 90° @ 40 Hz | vision positioning (VPS) — ground texture flows with translation |
+| `cam_up` | straight up | 110° @ 30 Hz | objects crossing overhead, against near-uniform sky |
+| `cam_fpv45` | forward, tilted 45° up from the body | 100° @ 30 Hz | FPV convention: level at the horizon when the quad pitches 45° nose-down for forward flight |
+
+Topics are `\/X3\/<name>\/image` plus a per-camera `\/X3\/<name>\/camera_info`
+(read intrinsics from there rather than hardcoding a focal length). The
+nesting is deliberate: gz-sim derives `camera_info` by replacing the last
+topic component, so flat names collapse all three onto one shared topic.
+
+Views are stacked bottom-right in the Gazebo window (Down → FPV 45deg →
+Up). The world also declares a world-level `<scene><sky>` — the `<scene>`
+inside the GUI plugin block styles only the interactive 3D view and is not
+read by sensor rendering, which is why camera frames were flat grey while
+the GUI looked right.
+
+`run_gazebo_bridge.sh` passes `--headless-rendering` to the **server**
+(not the GUI) so camera sensors don't open a stray visible render window
+on macOS.
+
 ### Gazebo environment
 - **Farm world**: Clearpath Robotics' `cpr_agriculture` scene ported from
   Gazebo Classic (single baked mesh; the model offset places the flight
