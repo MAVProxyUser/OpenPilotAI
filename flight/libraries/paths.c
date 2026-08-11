@@ -527,7 +527,14 @@ static void path_circle(PathDesiredData *path, float *cur_point, struct path_sta
                                         // altitude counts as level - full
                                         // horizontal pursuit
 #define INTERCEPT_LEVEL_RAMP     5.0f   // m: ramp horizontal back in over
-                                        // this band above LEVEL_BAND
+                                        // this band above LEVEL_BAND.
+                                        // 2.5 TRIED AND NEUTRAL (+0.78 ->
+                                        // +0.80 at 3.5): the gate releases on
+                                        // POSITION gap, so the full sprint
+                                        // always starts while still carrying
+                                        // ~2 m/s of climb - ramp width never
+                                        // touches that. The real entry-rate
+                                        // cap is VerticalVelMax (bridge).
 #define INTERCEPT_LAUNCH_HORIZ   0.15f  // horizontal fraction on the deck
 #define INTERCEPT_FLOOR_M        3.0f   // m: never command descent below this
 #define INTERCEPT_ENDGAME_DIST   4.0f   // m: inside this, pure pursuit - the

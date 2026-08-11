@@ -68,7 +68,14 @@ class Trail:
         if math.dist(self.last, p) < SEG_MIN:
             return
         try:
-            m = _marker_tube(self.id, self.last, p, self.rgba,
+            # _marker_tube expects GAZEBO ENU - the bridge's own TargetTrail
+            # converts NED first (pt = (ned[1], ned[0], -ned[2])). Handing it
+            # NED drew every segment mirrored and UNDERGROUND (z = -altitude),
+            # invisible in flight and briefly clipping through the surface as
+            # the ball fell to z~0 - which is exactly what was observed.
+            a_enu = (self.last[1], self.last[0], -self.last[2])
+            p_enu = (p[1], p[0], -p[2])
+            m = _marker_tube(self.id, a_enu, p_enu, self.rgba,
                              diameter=TRAIL_DIAMETER)
             # OWN NAMESPACE. _marker_base stamps every marker
             # "ninjapilot_trail", and the bridge issues DELETE_ALL on exactly

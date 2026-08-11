@@ -123,7 +123,7 @@ TARGET_END         = (34.0, 34.0)     # N, E: the opposite corner, via overhead
 # 3.0 CRASHED (spd01) - the velocity loop is tuned at 1.5 m/s and goes
 # unstable at 3.0. Raw speed is not available without retuning
 # HorizontalVelPID first. Back to 2.2, which flies.
-INTERCEPT_SPEED    = 2.6    # m/s cap handed to the firmware (EndingVelocity)
+INTERCEPT_SPEED    = float(os.environ.get("NINJAPILOT_ISPEED", "2.6"))    # m/s cap handed to the firmware (EndingVelocity)
 # LAG COMPENSATION, owned by the estimator rather than by the guidance law.
 #
 # The clean-baseline miss was a repeatable 0.57-0.59m directly BEHIND the
@@ -221,6 +221,12 @@ TARGET_TURN_DEG    = float(os.environ.get("NINJAPILOT_TURN_DEG", "55.0"))
 
 _target_state = [None]   # (t, (N,E,D)) newest ground-truth target pose
 _last_accel_g = [1.0]    # |specific force| in g, from the vehicle's own IMU
+# PEAK-HOLD companion. The IMU callback runs at 250Hz; the intercept loop
+# reads at ~19Hz, so a collision impulse a few samples wide fell BETWEEN
+# reads - a watched, physics-confirmed slam (ta1) scored felt=False. The
+# callback keeps the running maximum; the loop reads AND RESETS it, so no
+# impulse can alias away regardless of loop rate.
+_peak_accel_g = [1.0]
 _contact_hit = [None]    # wall-clock of the PHYSICS ENGINE's own contact report
 POSE_TOPIC = "/world/%s/pose/info" % GAZEBO_WORLD
 IMU_TOPIC = "/X3/imu"
@@ -475,6 +481,8 @@ def on_imu(msg):
     # genuinely "what the flight controller felt", not a Gazebo side channel.
     # Hovering reads ~1g; a strike shows as a short spike above it.
     _last_accel_g[0] = math.sqrt(sum(x * x for x in a_frd)) / 9.80665
+    if _last_accel_g[0] > _peak_accel_g[0]:
+        _peak_accel_g[0] = _last_accel_g[0]
     state.update_from_imu(gyro_dps, a_frd)
 
 
@@ -2650,7 +2658,11 @@ def _intercept_run(node, client):
             broke_off[0] = time.time()
             print(f"[intercept] *** GAZEBO CONTACT *** t+{hit_gz[0]:.1f}s sep={sep:.2f}m")
         # (2) the vehicle's own IMU
-        g = _last_accel_g[0]
+        # Read-and-reset the 250Hz peak, not the instantaneous sample -
+        # see _peak_accel_g. The track keeps recording the instantaneous
+        # value; only the DETECTOR uses the peak.
+        g = _peak_accel_g[0]
+        _peak_accel_g[0] = _last_accel_g[0]
         peak_g = max(peak_g, g)
         if g > IMU_HIT_G and hit_imu is None and time.time() - t0 > 3.0:
             hit_imu = (time.time() - t0, g)

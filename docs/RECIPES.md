@@ -311,6 +311,21 @@ print(n.request('/gui/follow', s, StringMsg, Boolean, 1000))"
   CYLINDER markers (TRAIL_DIAMETER 0.22, alpha ~0.3) - gz renders
   LINE_STRIP at 1px which is invisible at scene distance. Flown tube
   extends one segment per ~1m of travel.
+- **Trails now draw from a SEPARATE PROCESS (tools/trail_daemon.py)** so the
+  blocking /marker calls cost the flight loop nothing - launched by
+  run_intercept.sh and (with NINJAPILOT_MISSION_TRAIL_INPROC=0) run_star.sh.
+  It subscribes to the pose stream directly. If trails do not appear:
+    - check its heartbeat log ($LABEL_trails.log): "flown=N target=N
+      planned=N" with N climbing means it IS drawing; "drone=NO" means it is
+      not seeing the model (it matches "x3" lowercase - Gazebo's name).
+    - daemon markers use ns="ninjapilot_daemon" so the bridge's DELETE_ALL on
+      "ninjapilot_trail" does not wipe them.
+    - it feeds _marker_tube GAZEBO ENU (converts NED first); handing it NED
+      draws everything underground.
+  Manual: `./venv/bin/python3 tools/trail_daemon.py [world]`.
+- **Whole-farm GUI view**: the world's <camera_pose> is set for an overview
+  with the barn at the top; run_intercept.sh points the camera there via
+  /gui/move_to/pose. NINJAPILOT_FOLLOW=1 restores vehicle-chase instead.
 - /marker quirks (cost a lot of debugging): ack type is gz.msgs.Empty;
   the request often returns ok=False even though the marker REGISTERED
   - verify with `/marker/list` (Marker_V), never trust the ok flag.
@@ -475,26 +490,46 @@ Env knobs, no rebuild needed:
 | var | default | what it does |
 |---|---|---|
 | `NINJAPILOT_VISION` | 1 | 0 disables the camera bearing channel (EKF then runs on position only) |
-| `NINJAPILOT_LAG_S` | 0.48 | seconds the EKF predicts ahead; 0 = no lag compensation |
-| `NINJAPILOT_TRAILS` | 1 | 0 drops the marker trails for faster batches |
+| `NINJAPILOT_LAG_S` | 0.20 | seconds the EKF predicts ahead; 0 = no lag compensation. NOTE it is engagement-specific: 0.48 was right at DETECT_RANGE 34, 0.20 at 46 - re-measure if the geometry changes |
+| `NINJAPILOT_ISPEED` | 2.6 | interceptor speed override, no rebuild |
+| `NINJAPILOT_TRAILS` | 1 | 0 drops the trails (drawn by tools/trail_daemon.py) |
+| `NINJAPILOT_FOLLOW` | 0 | 1 makes the GUI chase the vehicle; default is the whole-farm overview |
 | `TARGET_SPEED` | 1.2 | target m/s |
 
-### Settled intercept values
+### Settled intercept values (the COMMITTED baseline)
 
-Ten consecutive first-pass contacts, 0.45-0.58m against 0.582m geometry.
+At 2.6 m/s this strikes 7-8 of 8 first-pass, 0.45-0.58m against 0.582m
+geometry. `felt=True` (physics contact) is the criterion; a sampled 0.58m IS
+the corner-on contact distance, so it cannot go lower once the ball deflects.
 
 | knob | value | note |
 |---|---|---|
 | `INTERCEPT_LEVEL_BAND` | 0.10 m | **the load-bearing one.** Climb to level BEFORE committing horizontally. 1.5 -> 0.10 took the miss 1.2m -> 0.5m |
-| `INTERCEPT_SPEED` | 2.6 m/s | 3.0 is unstable without retuning HorizontalVelPID |
-| `TRACK_LAG_S` | 0.48 s | EKF forward prediction; replaced a firmware constant that made things WORSE |
-| `INTERCEPT_AIM_HIGH_M` | 0.0 | tested twice, buys nothing - see the shared-budget note |
+| `INTERCEPT_SPEED` | 2.6 m/s | see the speed warning below |
+| `DETECT_RANGE` | 46 m | earlier detection = more time; the only lever the shared budget allows |
+| `INTERCEPT_HIT_DIST` | 0.485 m | score ONLY guaranteed contact (face-on); real contact comes from the ball's sensor |
+| `TRACK_LAG_S` | 0.20 s | EKF forward prediction; replaced a firmware constant that made things WORSE |
+| `INTERCEPT_AIM_HIGH_M` | 0.0 | tested twice, buys nothing - shared-budget |
 | `INTERCEPT_CLIMB_FRAC` | 0.6 | 0.9 is worse and noisier |
+
+**SPEED IS CAPPED AT 2.6 UNTIL THE VERTICAL PID IS FIXED - do not just raise
+INTERCEPT_SPEED.** 3.0 was pushed and proved a STOCHASTIC knife-edge
+(~40-50% strike): the vehicle sometimes overshoots the target's altitude by
++0.7m at level-off. The overshoot is a position-P term in pidcontroldown.cpp
+added DOWNSTREAM of guidance, so no guidance-side cap (cmd[2], VerticalVelMax)
+bounds it. The airframe itself flies 4.0 m/s stably - it is NOT the limit.
+Full analysis and the list of measured-and-reverted attempts is in CLAUDE.md
+("CORRECTION to TEN consecutive first-pass"). Fix the vertical PID first.
 
 **Do not spend runs re-splitting the error budget.** Horizontal and vertical
 trade ~1:1 and their sum is conserved near 0.5m because `vmax` is shared
 (`horizontal = sqrt(vmax^2 - v_climb^2)`). More capability or more time is
 the only way below that floor.
+
+**Restart the gz server between comparison batches.** A long-lived server
+eventually no-flies (estimator never inits), and marginal results spread
+across spawn/reset cycles are not comparable - a fresh-server A/B is what
+distinguished real variance from an apparent server-age effect this session.
 
 ## Validate estimator/filter changes OFFLINE before flying them
 

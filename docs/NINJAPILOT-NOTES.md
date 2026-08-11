@@ -302,6 +302,73 @@ coupled with a gain change (invalid), and once cleanly here. The clean test
 says it works exactly as intended on the vertical axis and buys nothing
 overall, for the budget reason above.
 
+### CORRECTION to "TEN consecutive first-pass" - it does NOT reproduce at 3.0 (2026-08-10, late)
+
+The "ten consecutive first-pass contacts" above were at INTERCEPT_SPEED 2.6
+and DO hold there (7-8/8 across several batches). A later push to raise speed
+tried to carry that to 3.0 and it FELL APART - not into a clean failure, into
+VARIANCE. At an identical, verified config on a freshly restarted server,
+consecutive 3.0 runs went: strike (-0.02) / strike / MISS (+0.66) / MISS
+(+0.73) / MISS high (+0.82) / strike / no-fly. Roughly 40-50% strike.
+
+Two wrong conclusions were reached and then corrected on the way, both worth
+recording so they are not re-reached:
+  - "3.0 strikes repeatably" - FALSE. It was built on the first two runs
+    (r30a/r30b), which were the lucky tail of a high-variance distribution.
+  - "the envelope changes regressed the vertical" - ALSO FALSE. fr2 struck at
+    -0.02 on the exact config that fr1 missed at +0.82, so it is variance, not
+    a regression. A fresh-vs-aged-server confound was hypothesised and
+    DISPROVEN the same way (fresh server produced both a strike and a miss).
+
+THE MECHANISM (this is the durable finding). The miss is a stochastic
+vertical LEVEL-OFF OVERSHOOT: the vehicle climbs to the target's altitude and
+sometimes coasts +0.7m past it before settling, landing the merge at the
+overshoot peak. The reason a climb-rate cap in paths.c cannot stop it:
+pidcontroldown.cpp assembles the commanded down-velocity as
+
+    velDown = progress->path_vector[2]        // guidance feed-forward (capped)
+              + pid_apply(PIDpos, correction_vector[2], dt)   // position term
+
+The position term is a P-loop on the FULL vertical gap and is added
+DOWNSTREAM of guidance, so neither `cmd[2]` (capped 1.55 in path_intercept)
+nor VtolPathFollowerSettings.VerticalVelMax bounds the flown climb - measured
+3.5 m/s entry against a 2.0 setpoint cap. Whatever cures the 3.0 overshoot has
+to live in the vertical PID (pidcontroldown), or in decelerating the climb
+before level-off, NOT in the guidance feed-forward. This is the same
+"downstream code owns the value" trap as the actuator slew limiter and the
+corner controller.
+
+MEASURED-AND-REVERTED at 3.0, do not retry blind:
+  climb-entry cap 1.55 in paths.c   fixed +0.66 -> +0.02 ONCE (r30a), did not
+                                    reproduce; reverted with the envelope push
+  INTERCEPT_LEVEL_RAMP 5.0 -> 2.5   neutral (+0.78 -> +0.80)
+  VerticalVelMax 3.0 -> 2.0         no effect (climb bypasses it, see above)
+  envelope bundle (speed 3.0, MaxRollPitch 35, CruiseControlMaxPowerFactor
+  1.45, HorizontalVelMax 4.5)       REVERTED to committed baseline; the
+                                    airframe flew 4.0 m/s stably (no tumble,
+                                    so the airframe is NOT the speed limit -
+                                    the vertical overshoot is), but strike rate
+                                    did not survive the variance. Never
+                                    committed.
+
+The settled, committed-good intercept config is the 2.6 baseline
+(CruiseControlMaxPowerFactor 1.25, MaxRollPitch 25, HorizontalVelMax 3.0, no
+climb cap). Raising the speed is a REAL open task (task #63) but it is gated
+on fixing the vertical overshoot FIRST, in the vertical PID.
+
+### RULE: restart the gz server between comparison BATCHES, and never trust one run
+
+A server left running for hours of spawn/remove/reset cycles eventually
+produces a no-fly (the attitude estimator never initialises - "waiting for
+attitude estimator... Critical" forever, vehicle sits on the pad). It was
+seen twice this session (s35b, lock3, an fr3). run_intercept.sh now aborts
+such a run in ~60s instead of 270s and names the cause. But the deeper
+lesson: a marginal result spread across a long-lived server is not
+trustworthy - the +0.02/+0.82 split that looked like a server-age effect was
+actually pure run-to-run variance, and it took a fresh-server A/B to tell
+them apart. For any close call, restart the server and repeat before
+believing it.
+
 ### The stale target costs whole runs - re-check AFTER the reset
 
 A knocked-down ball survived both the `/world/quadcopter/remove` service AND
@@ -1081,6 +1148,33 @@ the mission supervision loop at 20Hz with 0.35m trail segments starved the
 thread feeding sensors to the firmware and flew the vehicle into the ground.
 The trail is cosmetic; it must never compete with flight-critical threads.
 Settled at 10Hz / 0.5m / 50ms marker timeout.
+
+**SUPERSEDED by tools/trail_daemon.py (2026-08-10): draw trails from a
+separate PROCESS.** Rationing the trail (10Hz/0.5m) was a compromise, not a
+fix - even off the guidance loop, a background THREAD still stalls it through
+the GIL while marshalling each blocking /marker call (measured: intercept
+closest approach 0.58 vs 1.91/2.19m with in-process trails on). A separate
+process has its own GIL and its own core, so trails draw at full rate and the
+flight loop never sees them. Measured over 3 star runs each: in-process
+trails gave 0.04/0.05/0.08m mean cross-track with a 0.41m worst excursion
+(intermittent starvation), the daemon gave a dead-flat 0.04 / 0.09m worst -
+so the load WAS costing star consistency, not just intercept hit rate. The
+daemon subscribes straight to Gazebo's pose stream and needs nothing from the
+bridge. NINJAPILOT_MISSION_TRAIL_INPROC=0 hands the star's trail to it;
+run_intercept.sh uses it unconditionally.
+
+Two SILENT bugs that made the daemon look broken (both invisible from
+outside, which is why it now prints a heartbeat with per-trail segment
+counts):
+  - Gazebo publishes the model as "x3" lowercase; matching "X3" drew nothing
+    at all while the process looked perfectly healthy.
+  - _marker_base stamps every marker "ninjapilot_trail", the exact namespace
+    the bridge DELETE_ALLs at mission start - so the bridge wiped everything
+    the daemon drew. Daemon markers now use "ninjapilot_daemon".
+  - Also: _marker_tube expects GAZEBO ENU (the bridge's TargetTrail converts
+    NED first: pt=(ned[1],ned[0],-ned[2])). The daemon handed it NED, drawing
+    every segment mirrored and UNDERGROUND - invisible in flight, briefly
+    clipping the surface as the ball fell. Fixed in Trail.tick.
 
 ### The corner controller is GONE - and it never ran
 

@@ -94,6 +94,21 @@ BRIDGE_PID=$!
 for _ in $(seq 1 90); do
     grep -q "intercept_test: " "$LOG" 2>/dev/null && break
     kill -0 "$BRIDGE_PID" 2>/dev/null || break     # died early
+    # EARLY ABORT on the two known dead-run signatures, so a doomed run
+    # costs ~60s instead of the full 270s. s35b sat "waiting for attitude
+    # estimator" for its entire window - the vehicle never left the pad -
+    # because the settle wait loops unboundedly when the gz server has gone
+    # stale after hours of spawn/remove cycles. The fix for the CAUSE is a
+    # server restart; this guard just stops the harness paying full price.
+    if [ "$(grep -c 'waiting for attitude estimator' "$LOG" 2>/dev/null || echo 0)" -gt 20 ]; then
+        echo "!!! ESTIMATOR STUCK (never initialised) - aborting run early."
+        echo "!!! The gz server is likely stale - restart run_gazebo_bridge.sh."
+        break
+    fi
+    if grep -q "FAIL - could not spawn target" "$LOG" 2>/dev/null; then
+        echo "!!! spawn failed - aborting run early."
+        break
+    fi
     sleep 3
 done
 grep -q "intercept_test: " "$LOG" 2>/dev/null || echo "!!! TIMEOUT - no verdict after ~270s"

@@ -414,14 +414,22 @@ applied wholesale.
 - The sim GPS is idealized-ublox-grade injected post-parser; a real-UBX
   byte-stream path into the firmware's GPS port is designed but
   deliberately not started.
-- **Intercept: contacts are not yet confirmed *strikes*.** All ten first-pass
-  runs satisfy the distance criterion, but only one registered a collision on
-  the physics engine (`felt=True`). Closing at 2–5 m/s, 20 Hz sampling steps
-  over the contact; the ball's contact sensor is the ground truth to trust.
-- **Vision's in-flight contribution is unmeasured.** The pipeline is wired
-  and validated offline, but every one of the ten scoring runs was flown with
-  `NINJAPILOT_VISION=0` to isolate the geometry. The A/B still owes a number.
-- **Intercept speed is capped by the velocity loop**, not the airframe:
-  `INTERCEPT_SPEED` 2.6 m/s flies clean, 3.0 is unstable without retuning
-  `HorizontalVelPID` first. That retune is the next real lever, since the
-  error budget above is capability-limited rather than tuning-limited.
+- **Intercept strikes are confirmed at 2.6 m/s (7–8 of 8, `felt=True`), but
+  not above it.** A push to 3.0 m/s proved a *stochastic* knife-edge
+  (~40–50% strike): the vehicle sometimes overshoots the target's altitude by
+  ~0.7 m at level-off and misses high. The overshoot is a position-P term in
+  `pidcontroldown.cpp` added *downstream* of guidance, so no guidance-side cap
+  (`cmd[2]`, `VerticalVelMax`) bounds it — the fix has to be in the vertical
+  PID. The airframe itself flew 4.0 m/s stably, so it is **not** the speed
+  limit; the vertical loop is. Speed stays at the committed 2.6 baseline until
+  that PID is addressed. (`NINJAPILOT_ISPEED` overrides for experiments.)
+- **Vision's in-flight contribution is unmeasured.** The pipeline is wired and
+  validated offline, but every scoring run was flown with `NINJAPILOT_VISION=0`
+  to isolate the geometry. The A/B still owes a number.
+- **Contact-sensor ground truth vs 20 Hz sampling.** `felt=True` from the
+  ball's own contact sensor is the criterion; a *sampled* 0.58 m separation is
+  the corner-on contact distance itself, so it cannot go lower once the ball
+  deflects — chasing that number is chasing a floor a real strike creates.
+- **The sim server degrades over a long session** (eventually a no-fly:
+  estimator never initialises). Restart it between comparison batches;
+  marginal results spread across many spawn/reset cycles are not comparable.
