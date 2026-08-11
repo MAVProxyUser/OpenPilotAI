@@ -59,6 +59,16 @@ if gz model --list 2>/dev/null | grep -q target_ball; then
     exit 1
 fi
 
+# TRAILS, in their own process. Blocking /marker calls cost the guidance
+# loop nothing from here - separate GIL, separate core - so plan/flown/target
+# can be drawn at full rate instead of the eighth-rate compromise the
+# in-process version needed. NINJAPILOT_TRAILS=0 disables.
+pkill -f trail_daemon.py 2>/dev/null
+if [ "${NINJAPILOT_TRAILS:-1}" != "0" ]; then
+    ( "$BR/venv/bin/python3" "$BR/tools/trail_daemon.py" \
+        > "$SCRATCH/${LABEL}_trails.log" 2>&1 & )
+fi
+
 rm -f ~/ninjapilot-build/fcwd/233CDC*.o* 2>/dev/null
 ( cd ~/ninjapilot-build/fcwd && NINJAPILOT_EXTERNAL_PHYSICS=1 \
     ~/ninjapilot-build/build/fw_simposix/fw_simposix.elf > "$SCRATCH/${LABEL}_fw.log" 2>&1 & )

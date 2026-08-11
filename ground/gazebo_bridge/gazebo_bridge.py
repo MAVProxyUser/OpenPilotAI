@@ -190,7 +190,17 @@ IMU_HIT_G          = 2.0    # g total accel: the IMU-side collision trigger
 # time the object would reach BARN_AT along its own track. Reported as margin,
 # and as how far along the track the hit landed - earliest is best.
 BARN_AT            = (20.0, 20.0)   # N, E: where the object strikes the farm
-TRAILS_ON          = os.environ.get("NINJAPILOT_TRAILS", "1") == "1"
+# SUPERSEDED BY tools/trail_daemon.py - default OFF.
+#
+# The in-process trail worker is kept for reference but no longer used: even
+# off-thread it stalls guidance through the GIL while marshalling each
+# blocking /marker call (0.58/1.91/2.19m closest approach with it on, versus
+# 0.58-0.60 with it off). Drawing now happens in a SEPARATE PROCESS with its
+# own GIL and its own core, subscribed straight to Gazebo's pose stream, so
+# it costs the guidance loop literally nothing and can run at full rate.
+# NINJAPILOT_TRAILS controls the daemon (see run_intercept.sh); set
+# NINJAPILOT_TRAILS_INPROC=1 only to reproduce the old behaviour.
+TRAILS_ON          = os.environ.get("NINJAPILOT_TRAILS_INPROC", "0") == "1"
 FLYAWAY_RANGE_M    = 22.0   # m from pad: past this and opening, break off
 ENGAGE_TIMEOUT_S   = 14.0   # s of active pursuit before breaking off
 # 34 -> 46: BUY TIME, because time is the only thing that helps.
@@ -3374,9 +3384,19 @@ def mission_test():
     last_seen_idx = None
     landed_grace = None
     leg_entry_dist = None
+    # MISSION TRAIL, in-process. Every flown.tick() that actually emits a
+    # segment is a BLOCKING gz service call on the mission supervision thread
+    # - the same thread that feeds sensors to the firmware. That combination
+    # once flew the vehicle into the ground, and the standing mitigation has
+    # been to RATION it (10Hz / 0.5m) rather than remove it.
+    # NINJAPILOT_MISSION_TRAIL_INPROC=0 hands the job to tools/trail_daemon.py
+    # instead, which draws from its own process and its own GIL and therefore
+    # costs this loop nothing.
+    trail_inproc = os.environ.get("NINJAPILOT_MISSION_TRAIL_INPROC", "1") == "1"
     while True:
         now = time.time()
-        flown.tick()
+        if trail_inproc:
+            flown.tick()
         have_pose, alt, _climb = state.pose_alt_climb()
         have_pose2, pos_ned, _, _, _, _ = state.snapshot()
         n, e = (pos_ned[0], pos_ned[1]) if have_pose2 else (0.0, 0.0)
