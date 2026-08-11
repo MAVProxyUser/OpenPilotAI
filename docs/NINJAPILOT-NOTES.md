@@ -356,6 +356,64 @@ The settled, committed-good intercept config is the 2.6 baseline
 climb cap). Raising the speed is a REAL open task (task #63) but it is gated
 on fixing the vertical overshoot FIRST, in the vertical PID.
 
+### SOLVED: the 3.0 m/s overshoot is VerticalPosP - but only against a SLOW target (2026-08-10, night)
+
+The stochastic +0.7m level-off overshoot that made 3.0 m/s a coin-flip is
+fixed by lowering `VerticalPosP` **0.25 -> 0.10** (bridge config, now
+env-overridable via NINJAPILOT_VPOSP so the star keeps its committed tune).
+
+    3.0 m/s, balloon 1.2, vP 0.25   +0.66 / +0.73 / +0.82   coin-flip, ~40-50%
+    3.0 m/s, balloon 1.2, vP 0.10   -0.06 / +0.01           2/2 STOPPED (felt)
+    3.0 m/s, balloon 1.2, vP 0.15   -0.10                   stopped
+    2.6 m/s, balloon 1.2, vP 0.25   -0.09 / -0.18           2/2 (baseline)
+
+WHY: velDown = guidance feed-forward + `VerticalPosP * vertical_gap`
+(pidcontroldown.cpp). At an 8m gap, 0.25 alone commands 2.0 m/s ON TOP of
+the feed-forward - that is the 3.5 m/s climb entry the taper then cannot
+arrest. 0.10 bleeds the climb off EARLY instead of fighting it at the top.
+Extra vertical-velocity D (0.08 -> 0.25) also works but arrives LOW
+(-0.29/-0.35) - it damps the climb rather than shortening it. Do not stack
+both; they are two different low-biases.
+
+### THE REAL SPEED LIMIT IS THE TARGET'S SPEED, and VerticalPosP does NOT fix it
+
+Balloon speed maps monotonically onto vertical error, and this reproduces:
+
+    balloon 1.2   vert -0.06 / +0.01     STOPPED
+    balloon 1.6   vert +0.33             barn hit
+    balloon 2.0   vert +0.75 / +0.77     barn hit (vP 0.10)
+    balloon 2.0   vert +0.65 / +0.83     barn hit (vP 0.05 - NO BETTER)
+
+`VerticalPosP` 0.05 vs 0.10 at balloon 2.0 is statistically identical, so the
+fast-target failure is NOT the position gain. THE MECHANISM IS UPSTREAM, in
+path_intercept's own climb demand:
+
+    float v_time = vgap / t_use;      // t_use SHRINKS as the balloon speeds up
+    float v_need = (|v_gapr| > |v_time|) ? v_gapr : v_time;   // takes the GREATER
+
+A faster target shortens time-to-intercept, so `v_time` grows, so guidance
+DEMANDS a faster climb - and a faster climb overshoots more. The merge then
+lands in the tail of the climb transient instead of after it settles. This
+is why an absolute climb-entry cap (tried earlier and judged "did not
+reproduce") looked useless: it was tested at balloon 1.2, where the
+time-matched term never binds. **Re-test the climb cap against balloon
+1.6-2.0, where the mechanism predicts it should matter.** That is the next
+experiment, not more VerticalPosP.
+
+### CONTACT IS NOT SPHERICAL - vertical tolerance is HALF the horizontal
+
+The frame is a flat box: it spans +/-0.235 horizontally (+/-0.332 corner-on)
+but only ~0.05 vertically. With the ball's 0.25 radius, contact needs
+|vert| <~ 0.30, against ~0.58 horizontally. Measured: a run with sampled
+separation **0.40m** - well inside the 0.485 "guaranteed contact" figure -
+scored felt=False because vert was +0.33; it passed straight over the ball.
+
+Consequences, both load-bearing:
+  - a scalar separation CANNOT score an intercept. Only the physics contact
+    sensor / IMU (felt=True) can.
+  - vertical accuracy matters roughly twice as much as horizontal, which is
+    why every failure mode in this whole investigation has been vertical.
+
 ### RULE: restart the gz server between comparison BATCHES, and never trust one run
 
 A server left running for hours of spawn/remove/reset cycles eventually

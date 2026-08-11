@@ -2131,11 +2131,22 @@ def spawn_target(node):
         ent = Entity()
         ent.name = TARGET_MODEL
         ent.type = Entity.MODEL
-        node.request(f"/world/{GAZEBO_WORLD}/remove", ent, Entity, Boolean, 3000)
-        time.sleep(1.0)
-        ok, rep = node.request(f"/world/{GAZEBO_WORLD}/create", req,
-                               EntityFactory, Boolean, 3000)
-        print(f"[intercept] respawn after clearing stale target -> ok={ok}")
+        # BOUNDED RETRY, not a single attempt. One remove + 1.0s was not
+        # enough: Gazebo does not free the model NAME synchronously, so a
+        # fast respawn still collides with the corpse of the last run's
+        # ball. Measured 2 lost runs in 10 during a timed trial - each one
+        # costs a full ~90s cycle AND (under strict scoring) looks like a
+        # guidance failure, which is worse than the lost time. Three tries
+        # with a growing wait clears it.
+        for attempt in range(3):
+            node.request(f"/world/{GAZEBO_WORLD}/remove", ent, Entity,
+                         Boolean, 3000)
+            time.sleep(1.0 + attempt)
+            ok, rep = node.request(f"/world/{GAZEBO_WORLD}/create", req,
+                                   EntityFactory, Boolean, 3000)
+            print(f"[intercept] respawn attempt {attempt + 1} -> ok={ok}")
+            if ok and rep.data:
+                break
     print(f"[intercept] spawn {TARGET_MODEL} at N={n} E={e} alt={TARGET_ALT}m -> ok={ok}")
     return ok
 
@@ -3863,7 +3874,16 @@ def uavtalk_thread():
             # NULL result (same cluster, 0 vs 1 contacts) - the vertical miss is
             # a sequencing problem, not loop weakness, so it is fixed in the
             # guidance (climb to target level before horizontal pursuit).
-            "HorizontalPosP": 0.35, "VerticalPosP": 0.25,
+            "HorizontalPosP": 0.35,
+            # VerticalPosP env-overridable for the level-off overshoot work.
+            # velDown = guidance feed-forward + VerticalPosP * vertical_gap
+            # (pidcontroldown.cpp ControlPositionWithPath), so at an 8m gap
+            # 0.25 alone asks for 2.0 m/s on top of the feed-forward - which
+            # is where the 3.5 m/s climb entry (and the +0.7m overshoot at
+            # level-off) comes from. Lowering it decelerates the climb EARLIER
+            # rather than trying to arrest it at the top. Default unchanged so
+            # the star keeps its committed tune; intercept batches override.
+            "VerticalPosP": float(os.environ.get("NINJAPILOT_VPOSP", "0.25")),
             # VerticalVelPID Kp 0.3->0.6, Ki 0.15->0.45: measured in a real
             # PositionHold sag (truth 2.4m -> ground in ~10s), the vertical
             # velocity PID's output hovered at ~0.69 against a true hover
@@ -3927,7 +3947,11 @@ def uavtalk_thread():
             # its own stability margin - pitch RMS 2.4 -> 6.0 deg, peak-to-peak
             # 41 deg, and overshoot 0.00 -> 0.13m. More gain just oscillates.
             # The settling problem is not solvable by pushing this loop.
-            "HorizontalVelPID": [5.5, 0.5, 1.4, 15], "VerticalVelPID": [0.6, 0.45, 0.08, 1.0],
+            "HorizontalVelPID": [5.5, 0.5, 1.4, 15],
+            # Vertical velocity loop; D is env-overridable (damping on the
+            # level-off arrest).
+            "VerticalVelPID": [0.6, 0.45,
+                               float(os.environ.get("NINJAPILOT_VVELD", "0.08")), 1.0],
             # ThrustLimits.Neutral is the altitude-hold PID's hover-point
             # baseline (vtolflycontroller.cpp: controlDown.UpdateNeutralThrust
             # uses it directly) - the XML's 0.5 default assumes a much

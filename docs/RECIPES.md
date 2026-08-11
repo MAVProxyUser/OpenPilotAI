@@ -531,6 +531,64 @@ eventually no-flies (estimator never inits), and marginal results spread
 across spawn/reset cycles are not comparable - a fresh-server A/B is what
 distinguished real variance from an apparent server-age effect this session.
 
+## Barn trial: does the balloon get stopped, or reach the barn?
+
+`tools/barn_trial.py` runs a scripted matrix of one-shot engagements and
+tallies STOPPED vs BARN HIT. Success requires **felt=True** (the vehicle's
+own IMU), never a separation number - see the contact-geometry note below
+for why separation alone scores false positives.
+
+```bash
+cd ground/gazebo_bridge
+cat > /tmp/plan.json <<'EOF'
+{"minutes": 40, "runs": [
+  {"label":"a1","ispeed":3.0,"tspeed":1.2,"vposp":0.10,"vveld":0.08}
+]}
+EOF
+cp /tmp/plan.json "$TMPDIR/barn_trial_plan.json"
+./venv/bin/python3 tools/barn_trial.py          # writes barn_trial_results.json
+./venv/bin/python3 tools/barn_tally.py          # tally, invalid runs excluded
+```
+
+It restarts the gz server every 6 runs and after any timeout/no-fly, hard-
+kills a run's whole process group at 300s, and reaps stragglers between runs
+- all three were needed; this rig has produced three distinct hangs.
+
+`barn_tally.py` separates INVALID runs (no-fly, spawn failure, timeout) from
+real barn hits. A run where the ball never spawned is a harness fault, not a
+guidance outcome; scoring it as a miss understates the guidance and hides
+harness bugs. Headline rate is over valid engagements only, with the invalid
+count printed alongside.
+
+### Measured envelope (2026-08-10, 18 valid engagements, tools/barn_trial_2026-08-10.json)
+
+| interceptor | balloon | stopped | vert at merge |
+|---|---|---|---|
+| 2.6 | 1.2 | 2/2 | -0.09 / -0.18 |
+| 3.0 (vP 0.10) | 1.2 | **2/2** | -0.06 / +0.01 |
+| 3.0 (vP 0.05) | 1.2 | **2/2** | +0.03 / +0.03 |
+| 3.0 | 1.6 | 1/2 | +0.31 / +0.46 |
+| 3.0 | 2.0 | 0/4 | +0.65 .. +0.83 |
+| 3.5 | 1.6 | 0/2 | +0.56 / +0.61 |
+
+**Recommended intercept config: INTERCEPT_SPEED 3.0 with
+NINJAPILOT_VPOSP=0.10.** 4/4 stopped with vertical inside +/-0.06, versus a
+~40-50% coin-flip at the stock 0.25. NOT made the default: `VerticalPosP` is
+shared with the star, and 0.10 has not been flown on a mission. Set it
+per-batch until someone runs the star at 0.10.
+
+**Balloon >= 1.6 m/s is where it breaks**, and NOT because of VerticalPosP -
+0.05 vs 0.10 at balloon 2.0 is statistically identical. Both speeds shorten
+time-to-intercept, which grows path_intercept's own `v_time = vgap/t_use`
+climb demand, which overshoots. Next lever is the climb cap in paths.c,
+re-tested against balloon 1.6-2.0 (it was previously tested at 1.2, where
+that term never binds). Full mechanism in CLAUDE.md.
+
+**CONTACT IS NOT SPHERICAL.** The frame is a flat box: ~+/-0.32m vertical
+tolerance vs ~+/-0.58 horizontal. A run at sampled separation **0.40m**
+scored felt=False because vert was +0.33 - it flew over the ball. Never
+score an intercept on separation.
+
 ## Validate estimator/filter changes OFFLINE before flying them
 
 ```bash
