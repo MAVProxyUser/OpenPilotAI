@@ -1,0 +1,18 @@
+# large binaries - re-downloadable, and one of them is corrupt upstream
+*.zip
+*.raw
+*.tar.xz
+*.img
+deploy/
+phase*.bin
+*.log
+
+# SECRETS - never commit. ssh/osd32mp1_key is a PRIVATE KEY.
+ssh/
+*_key
+*.pem
+
+# local python env
+venv/
+__pycache__/
+*.pyc
