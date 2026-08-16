@@ -36,6 +36,7 @@ import argparse
 import ctypes
 import multiprocessing as mp
 import os
+import struct
 import sys
 import time
 
@@ -98,6 +99,74 @@ def dronecan_proc(mag, gps, stop):
             node.spin(0.2)
         except Exception:
             time.sleep(0.1)
+
+
+def mpu_proc(imu, stop, bus_n, addr, cal_n):
+    """MPU-9150 gyro + accel over I2C -> shared memory.
+
+    Own process, like the other readers: an I2C burst is a blocking syscall,
+    and CLAUDE.md records two crashes caused by a blocking call on a background
+    THREAD stalling the sensor feed through the GIL.
+
+    The part boots ASLEEP (PWR_MGMT_1 = 0x40) and every register reads 0x00
+    until that is cleared - a scan finds it, WHO_AM_I answers, and the data is
+    all zeros, which reads exactly like a dead sensor.
+    """
+    import fcntl
+    I2C_SLAVE = 0x0703
+    fd = os.open(f"/dev/i2c-{bus_n}", os.O_RDWR)
+    fcntl.ioctl(fd, I2C_SLAVE, addr)
+
+    def wr(reg, val):
+        os.write(fd, bytes([reg, val]))
+
+    def rd(reg, n=1):
+        os.write(fd, bytes([reg]))
+        return os.read(fd, n)
+
+    wr(0x6B, 0x80); time.sleep(0.1)      # reset
+    # clock = PLL with X-gyro reference, not the internal 8 MHz RC: Invensense
+    # recommend it and the RC oscillator drifts noticeably with temperature.
+    wr(0x6B, 0x01); time.sleep(0.05)
+    wr(0x1A, 0x03)                        # DLPF ~44 Hz, 1 kHz internal rate
+    wr(0x19, 0x04)                        # SMPLRT_DIV -> 200 Hz
+    wr(0x1B, 0x18)                        # gyro  +/-2000 dps -> 16.4 LSB/dps
+    wr(0x1C, 0x00)                        # accel +/-2 g      -> 16384 LSB/g
+    time.sleep(0.05)
+
+    GS, AS = 16.4, 16384.0
+
+    # Startup bias removal. Measured -1.10/-0.24/-0.24 dps at rest on this
+    # part, which integrates into real attitude drift. The firmware's own
+    # filter also estimates gyro bias, so this only needs to remove the gross
+    # offset, not be perfect.
+    bias = [0.0, 0.0, 0.0]
+    if cal_n > 0:
+        acc = [0.0, 0.0, 0.0]
+        for _ in range(cal_n):
+            g = struct.unpack(">hhh", rd(0x43, 6))
+            for i in range(3):
+                acc[i] += g[i] / GS
+            time.sleep(0.005)
+        bias = [a / cal_n for a in acc]
+        imu[8], imu[9], imu[10] = bias
+
+    while not stop.value:
+        try:
+            b = rd(0x3B, 14)
+            ax, ay, az, t, gx, gy, gz = struct.unpack(">hhhhhhh", b)
+            imu[0] = gx / GS - bias[0]        # deg/s  (GyroSensor wants dps)
+            imu[1] = gy / GS - bias[1]
+            imu[2] = gz / GS - bias[2]
+            imu[3] = ax / AS * 9.80665        # m/s^2
+            imu[4] = ay / AS * 9.80665
+            imu[5] = az / AS * 9.80665
+            imu[6] = t / 340.0 + 36.53        # degC
+            imu[7] = time.time()
+        except OSError:
+            time.sleep(0.01)
+        time.sleep(0.004)                     # ~200 Hz
+    os.close(fd)
 
 
 def accel_proc(accel, stop, rate):
@@ -175,6 +244,21 @@ def accel_to_uav(a):
     return {"x": a[0], "y": a[1], "z": a[2], "temperature": 25.0}
 
 
+def gyro_to_uav(m):
+    """MPU-9150 -> GyroSensor. Units are deg/s, body FRD (see the object table
+    in README). Mounting rotation is identity until the part is bolted down -
+    the same caveat as the mag and accel, and the likeliest source of a sign
+    error."""
+    return {"x": m[0], "y": m[1], "z": m[2], "temperature": m[6]}
+
+
+def mpu_accel_to_uav(m):
+    """MPU-9150 -> AccelSensor, m/s^2 body FRD. Preferred over the ADXL345:
+    measured |a| 0.981 g vs 0.912 g uncalibrated, because it is a 16-bit part
+    (0.061 mg/LSB) against the ADXL's 13-bit full-res (3.9 mg/LSB)."""
+    return {"x": m[3], "y": m[4], "z": m[5], "temperature": m[6]}
+
+
 def pump_rx(client, uavtalk, seen):
     """Drain whatever the firmware sent back, through the SAME client.
 
@@ -224,6 +308,12 @@ def main():
     ap.add_argument("--seconds", type=float, default=0.0)
     ap.add_argument("--no-accel", action="store_true")
     ap.add_argument("--no-can", action="store_true")
+    ap.add_argument("--no-mpu", action="store_true")
+    ap.add_argument("--mpu-bus", type=int, default=3)
+    ap.add_argument("--mpu-addr", type=lambda x: int(x, 0), default=0x68)
+    ap.add_argument("--gyro-cal", type=int, default=200,
+                    help="stationary samples for startup bias removal (0=off)")
+    ap.add_argument("--accel-source", choices=("mpu", "adxl"), default="mpu")
     ap.add_argument("--xml-dir", default=DEFAULT_XML)
     ap.add_argument("--verify", action="store_true",
                     help="read the sensor objects back out of the firmware")
@@ -232,6 +322,7 @@ def main():
     mag = mp.Array(ctypes.c_double, 4)
     accel = mp.Array(ctypes.c_double, 4)
     gps = mp.Array(ctypes.c_double, 10)
+    imu = mp.Array(ctypes.c_double, 11)   # gx,gy,gz,ax,ay,az,T,ts,bias[3]
     stop = mp.Value(ctypes.c_int, 0)
 
     procs = []
@@ -240,6 +331,10 @@ def main():
                                 daemon=True))
     if not a.no_accel:
         procs.append(mp.Process(target=accel_proc, args=(accel, stop, a.accel_rate),
+                                daemon=True))
+    if not a.no_mpu:
+        procs.append(mp.Process(target=mpu_proc,
+                                args=(imu, stop, a.mpu_bus, a.mpu_addr, a.gyro_cal),
                                 daemon=True))
     for p in procs:
         p.start()
@@ -274,17 +369,18 @@ def main():
             now = t0
 
             # --- GyroSensor EVERY tick: it is what triggers the inner loop.
-            #     Zeros until a real gyro exists. Documented, not forgotten.
+            gyro_live = (now - imu[7]) < STALE_S
+            gv = gyro_to_uav(imu) if gyro_live else {"x": 0.0, "y": 0.0,
+                                                     "z": 0.0, "temperature": 25.0}
             if client:
-                client.send_object("GyroSensor",
-                                   {"x": 0.0, "y": 0.0, "z": 0.0,
-                                    "temperature": 25.0})
+                client.send_object("GyroSensor", gv)
             sent["gyro"] += 1
             time.sleep(gap)
 
             # --- AccelSensor on alternate ticks, separated from the gyro send
-            if n % 2 == 0 and now - accel[3] < STALE_S:
-                v = accel_to_uav(accel)
+            use_mpu_accel = (a.accel_source == "mpu" and now - imu[7] < STALE_S)
+            if n % 2 == 0 and (use_mpu_accel or now - accel[3] < STALE_S):
+                v = mpu_accel_to_uav(imu) if use_mpu_accel else accel_to_uav(accel)
                 if client:
                     client.send_object("AccelSensor", v)
                 sent["accel"] += 1
@@ -328,8 +424,11 @@ def main():
                       f"{mag[2]*100:+.1f} uT]  "
                       f"accel[{fresh(accel[3])} {accel[0]:+.2f},{accel[1]:+.2f},"
                       f"{accel[2]:+.2f}]  "
-                      f"gps[{fresh(gps[9])} sats={int(gps[6])} fix={int(gps[7])}]  "
-                      f"sent={sent}")
+                      f"gps[{fresh(gps[9])} sats={int(gps[6])} fix={int(gps[7])}]\n"
+                      f"      gyro[{fresh(imu[7])} {imu[0]:+.2f},{imu[1]:+.2f},"
+                      f"{imu[2]:+.2f} dps]  "
+                      f"mpu-accel[{imu[3]:+.2f},{imu[4]:+.2f},{imu[5]:+.2f}]  "
+                      f"{imu[6]:.1f}C  sent={sent}")
                 if a.verify:
                     if not seen:
                         print("      firmware: nothing read back yet")

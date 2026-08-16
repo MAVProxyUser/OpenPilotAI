@@ -327,6 +327,17 @@ Prove the controller independently of the wiring:
 ssh osd32mp1 'ip link set can0 down; ip link set can0 up type can bitrate 1000000 loopback on; (candump -T 2000 can0 &); cansend can0 123#DEADBEEF; sleep 2'
 ```
 
+## Measure CAN bus load and timing
+
+```bash
+ssh osd32mp1 'cd /usr/local/ninja && python3 can_bandwidth.py --seconds 300'
+```
+
+Reports bus utilisation (nominal and worst-case bit stuffing) and, per message
+type, the **transfer** rate/jitter/max-gap plus frames-per-message. Uses kernel
+`SO_TIMESTAMP`, and counts a transfer only on the tail byte's start-of-transfer
+bit - timing raw frames reports ~300 % jitter that is entirely artifact.
+
 ## DroneCAN: grant node IDs and watch live sensor data
 
 Nodes stay silent until something allocates them an ID:
@@ -350,3 +361,142 @@ image — `dronecan.app.dynamic_node_id` imports `sqlite3` at module scope, so
 **`import dronecan` itself fails** without it, not just the allocator. The
 library `libsqlite3.so.0` is already present; only Python's `_sqlite3`
 extension is absent, and ST's OpenSTLinux apt feed has it.
+
+
+## Bring up CAN after a reboot (do this BEFORE believing any sensor is missing)
+
+`can0` comes up DOWN, and `ip` is not on root's default PATH — so the obvious
+command fails with a bare `sh: ip: not found`.
+
+```bash
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ip link set can0 up type can bitrate 1000000
+ip -br link show can0
+```
+
+Then start the dynamic node-ID allocator. Until it runs, **every node sits
+broadcasting anonymous allocation requests and publishes no sensor data**, so
+the bus looks dead and a bridge run reports `mag: 0` and `gps: 0`:
+
+```bash
+setsid nohup python3 /home/root/dronecan_allocator.py > /tmp/alloc.log 2>&1 &
+```
+
+`setsid` matters: a plain `&` job is killed by SIGHUP when the ssh session ends.
+
+Healthy bus, ~15 s after the allocator starts:
+
+    msg 1001  25.1 Hz  node 125   magnetometer
+    msg 1061   5.0 Hz  node 124   gnss.Auxiliary
+    msg 1063   5.0 Hz  node 124   gnss.Heading
+    msg  341   3.0 Hz  nodes 124/125/127  NodeStatus
+
+## Read the magnetometer off CAN
+
+Payload is three `float16` Gauss values at **offset 0** — there is no
+`sensor_id` byte. Count transfers, not frames: only frames whose tail byte has
+bit 0x80 set start a transfer. Skip `node == 0`, whose ID layout differs.
+
+```python
+cid, dlc = struct.unpack("<IB", frame[:5]); cid &= 0x1FFFFFFF
+node = cid & 0x7F
+if node and (cid >> 8) & 0xFFFF == 1001:
+    b = frame[8:8+dlc]
+    if b[dlc-1] & 0x80:                        # start of transfer
+        x, y, z = struct.unpack("<eee", b[:6]) # Gauss
+```
+
+Sanity check the magnitude before trusting any of it: Earth's field is
+0.25-0.65 Ga (25-65 uT). A reading of thousands of Gauss means the offset is
+wrong, not that the sensor is broken.
+
+## Read firmware diagnostics (the ring, not stdout)
+
+Flight-loop diagnostics go to a lock-free ring in `/dev/shm/ninjapilot-log`
+(printf in a flight loop caused priority-inversion deadlock - see CLAUDE.md).
+
+```bash
+shmlogd            # follow live, like tail -f
+shmlogd --dump     # replay backlog and exit - WORKS AFTER A CRASH
+```
+
+The ring survives firmware death, so `--dump` after a wedge shows the final
+seconds. Build if missing: `cc -O2 -o /usr/bin/shmlogd osd32mp1/shmlogd.c`.
+Only one firmware instance can run: the flock pidfile at
+`/var/run/ninjapilot-fw.pid` names the pid of whoever holds it.
+
+## Build the custom AP_Periph for the L431 (gcc 10.2.1 ONLY)
+
+The patch (`ap-periph-ninja-debug.patch`) adds the declared BMP388 probe that
+the stock hwdef structurally cannot do (`HAL_I2C_INTERNAL_MASK 1` hides the
+bus from every `BARO_PROBE_EXT` bit), plus a bench I2C scanner with SDA/SCL
+swap detection reported over `debug.LogMessage`.
+
+```bash
+# toolchain: gcc 13.3 produces images that HOLD THE NODE IN ITS BOOTLOADER.
+# 10.2.1 (arm-gnu 10-2020-q4-major) is ArduPilot's blessed compiler and works.
+export PATH=~/gcc-arm-none-eabi-10-2020-q4-major/bin:$PATH
+
+# the tree must live at a path with NO SPACES (ChibiOS scripts break)
+cd ~/ardupilot
+git apply "<repo>/osd32mp1/ap-periph-ninja-debug.patch"
+
+./waf configure --board MatekL431-Periph   # RERUN after ANY hwdef edit -
+./waf AP_Periph                            # else you get a byte-identical
+                                           # binary and a 2-second "success"
+```
+
+Output: `build/MatekL431-Periph/bin/AP_Periph.bin`. The exact flashed binary
+is committed as `fw/AP_Periph-ninja-gcc10.bin` (md5-verify against it after a
+rebuild if you expect no change). Parameters survive app updates.
+
+## Flash an L431 node over CAN, and recover a failed flash
+
+```bash
+scp fw/AP_Periph-ninja-gcc10.bin root@<board>:/home/root/fw/AP_Periph.bin
+ssh root@<board> 'python3 can_flash.py'    # flashes node 124, ~2 min at 1.7 KB/s
+```
+
+`can_flash.py` sends `BeginFirmwareUpdate` and serves the file itself. It
+embeds the three dronecan-python traps: every `node.spin()` wrapped (raises
+`TransferError` on wire noise), request callbacks guarded against None (the
+timeout value), flasher node id 126 (127 is the resident allocator).
+
+**Judging the result — the bootloader identity trap:** anything answering
+GetNodeInfo with `sw 2.0 vcs=00000000 mode=MAINTENANCE vendor≈13` is the
+BOOTLOADER, not an app. A flash is done ONLY when mode reads OPERATIONAL (0)
+and the sensor suite publishes. The healthy boot trace is mode 3 → 1 → 0.
+
+**Recovery floor (tested live):** a failed or interrupted flash leaves the
+node's bootloader waiting on the bus in mode 3 — reachable and reflashable
+forever. The CAN update path never writes the bootloader region, so the worst
+case is a waiting bootloader, never a brick. Re-run the flasher with a good
+image (the stock one from
+https://firmware.ardupilot.org/AP_Periph/latest/MatekL431-Periph/ always
+works). SWD pads are the absolute fallback; they have never been needed.
+
+## Recover a CAN node that has gone deaf (TX storm / pool starvation)
+
+Symptom: the node heartbeats but answers NOTHING (params, restart, Begin all
+time out), sensor rates collapsed, multi-frame transfers never complete.
+Software cannot break in — the shared canard pool is exhausted.
+
+Arm the ambush on the board, then power-cycle the node:
+
+```python
+# spam BeginFirmwareUpdate ~5/s; the app's ~1s init calm after power-on
+# hears it before the storm starts and parks in the bootloader (mode 3)
+node = dronecan.make_node("can0", node_id=126, bitrate=1000000)
+fs = dronecan.app.file_server.FileServer(node, lookup_paths=["/home/root/fw"])
+begin = dronecan.uavcan.protocol.file.BeginFirmwareUpdate.Request(
+    source_node_id=126,
+    image_file_remote_path=dronecan.uavcan.protocol.file.Path(path="AP_Periph.bin"))
+while True:
+    node.request(begin, 124, lambda e: None, timeout=0.2)
+    node.spin(0.1)   # watch NodeStatus for mode 3, then keep serving
+```
+
+Once parked, run `flash124b.py` (a fresh Begin re-attaches cleanly even if
+the ambush server died mid-feed). Judge success ONLY by mode==0 AND the
+sensor suite publishing — `mode = (b[4]>>3)&7`, and health `(b[4]>>6)` is
+NOT mode.

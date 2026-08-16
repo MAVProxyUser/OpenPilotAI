@@ -310,6 +310,132 @@ only evidence that a second node existed**, so the misdecode was concealing the
 device count as well as the message type. Group anonymous senders by
 discriminator, never by node id (they are all 0).
 
+## TRAP: read the MODULE's design, not just the chip's datasheet
+
+The GY-63 refused to answer on I2C while the MPU9150 on the SAME bus worked
+perfectly - proving bus, pull-ups, 3.3 V and SDA/SCL orientation were all fine.
+Two wrong theories were chased before the real one:
+
+1. "PS is floating so it is in SPI mode" - plausible (see below, it IS a real
+   trap) but jumpering PS and CSB changed nothing.
+2. "SDA/SCL are swapped" - **wrong by construction**: another device on the same
+   bus still answered, which proves the orientation. Swapping would only have
+   broken what worked. Do not reach for this when a second device is happy.
+
+**The actual cause is the module, not the chip.** A GY-63 carries a
+**MIC5205 3.3 V regulator plus level-shifting MOSFETs** and is designed to be
+fed **5 V**. A MIC5205-3.3 needs ~3.47 V in to regulate, so at 3.3 V it sits in
+dropout: the internal rail sags, the level shifters (gate-referenced to that
+sagged rail) never switch, and the part is electrically absent from the bus
+while its power LED - wired across the INPUT - still cheerfully lights.
+
+"MS5611 is not 5 V tolerant" is true of the die and **actively misleading about
+the board**. Always check whether a breakout has its own regulator and
+shifters before choosing a supply voltage.
+
+Beware the obvious fix: powering a GY-63 from 5 V puts 5 V-referenced pull-ups
+on the bus, which would endanger the 3.3 V-only MPU9150 sharing it. Test such a
+module ALONE, and measure SDA idle voltage before letting them coexist.
+
+**Preferred replacement: Adafruit BMP388.** Its breakout has a 3.3 V regulator
+*and* level shifting explicitly rated for 3 V or 5 V logic, so it works on this
+bus as-is; 0.1 m altitude noise, addr 0x77 (0x76 with SDO low). Note this tree
+has `pios_ms5611.c` but NO BMP388 driver, so the native-firmware path would
+need writing later - irrelevant to the Python bridge.
+
+### The PS/CSB trap is still real, just not what bit us here
+
+Symptom: power LED on, `i2cdetect` finds nothing at 0x76 or 0x77, wiring looks
+perfect, and another device on the SAME bus (the MPU9150 at 0x68) works fine -
+which proves the bus, pull-ups, 3.3 V and SDA/SCL orientation are all correct.
+
+The MS5611 has a hard **protocol-select input**:
+
+    PS  HIGH            -> I2C
+    PS  LOW or FLOATING -> SPI   <-- ignores I2C entirely, never ACKs
+
+Many GY-63 boards break `PS` out without pulling it anywhere, so it floats and
+the part sits in SPI mode. No amount of correct SDA/SCL wiring helps.
+
+    PS  -> 3.3 V     required for I2C
+    CSB -> GND       address 0x77   (3.3 V -> 0x76)   must NOT float
+    SDO -> unconnected              (SPI MISO, unused in I2C mode)
+
+`CSB` polarity feels inverted because the datasheet address is `111011C` where
+**C is the COMPLEMENT of CSB** - pulling CSB low yields 0x77.
+
+Do not chase this by swapping SDA/SCL: if another device on the same bus still
+answers, the bus orientation is proven correct and swapping only breaks what
+works. A power LED proves nothing - it sits across the supply rail and lights
+whenever VCC is present, regardless of protocol mode or whether the sensor is
+soldered to the bus at all.
+
+## MEASURED: the CAN bus is 1.4% loaded and its timing is navigation-grade
+
+300 s sample, 29,401 frames, kernel `SO_TIMESTAMP` (not `time.time()` in the
+read loop - Python's own scheduling jitter on this 2-core armv7 is the same
+order as the jitter being measured):
+
+    frames            98.0 /s
+    on-wire           12.3 kbit/s nominal, 14.5 kbit/s worst-case stuffing
+                      = 1.23 - 1.45 % of 1 Mbit
+    headroom          ~98.6 % free
+
+| transfer | Hz | period | sd | max gap | frames/msg |
+|---|---|---|---|---|---|
+| `ahrs.MagneticFieldStrength` (n125) | 25.00 | 40.0 ms | **0.5 ms** | 53.7 ms | 1 |
+| `gnss.Fix2` (n124) | 5.00 | 200.0 ms | **2.8 ms** | 216.3 ms | 10 |
+| `gnss.Auxiliary` (n124) | 5.00 | 200.0 ms | 0.7 ms | 201.8 ms | 3 |
+| vendor 20003 (n124) | 5.00 | 200.0 ms | 1.9 ms | 212.8 ms | 1 |
+| `NodeStatus` x3 | 1.00 | 1000 ms | ~1 ms | ~1002 ms | 1 |
+
+Jitter is **1.25 % of period for the mag and 1.4 % for GPS**, and across ~12,900
+transfers the worst gap was 1.34x nominal - i.e. **no dropouts at all**. Both
+are comfortably usable for navigation; 5 Hz GPS is what ArduPilot/PX4 use
+anyway.
+
+### MEASURE TRANSFERS, NOT FRAMES
+
+The first run of this reported "gnss.Fix2 50 Hz, sd 58.9 ms, jitter 295 %" and
+that was **pure artifact**. A multi-frame DroneCAN transfer emits its frames
+back to back (~0.1 ms apart) then nothing until the next message, so timing raw
+frames averages two completely different populations. Count a transfer only
+when the tail byte's **start-of-transfer bit (0x80)** is set. Same data, same
+run: 5.00 Hz, sd 2.8 ms, verdict OK.
+
+### Frame economics, now empirical rather than estimated
+
+Measured **147.9 bits/frame** worst case = **148 us at 1 Mbit**, and Fix2 is
+**10 frames/transfer** = 1.48 ms per message. So a `RawIMU` on this bus:
+
+| rate | bus |
+|---|---|
+| 100 Hz | 14.8 % |
+| 200 Hz | 29.6 % |
+| 500 Hz | **73.9 %** - FITS, but see below |
+| 1000 Hz | **147.9 %** - exceeds the bus |
+
+**CORRECTION (user called it): "no headroom left" overstated the capacity
+argument.** 73.9 % + today's 1.2 % fits on the wire. The real arguments
+against gyro-over-CAN are latency and budget, not capacity:
+- a 10-frame transfer is **1.48 ms of serialization** - the sample cannot be
+  consumed until its last frame lands, so the gyro-triggered inner loop eats
+  ~75 % of its 2 ms period as pure transport delay, before queueing. At 74 %
+  utilisation, queueing multiplies waits ~4x on top.
+- the plan puts MOTOR COMMANDS on this same bus. ESC/actuator streams at
+  200-400 Hz cost 6-12 %+; the gyro stream would spend the margin the
+  control OUTPUT path needs - and the output path cannot tolerate jitter.
+- two IMUs at 500 Hz (MPU-9150 + ICM-20602) genuinely do not fit: 148 %.
+A REDUNDANT gyro stream at 100-250 Hz over CAN (15-37 %) is perfectly
+reasonable; the PRIMARY 500 Hz gyro belongs on SPI/local for latency, not
+for bandwidth.
+
+This confirms the earlier back-of-envelope estimate (~1.35 ms/sample) with real
+numbers, and settles it: `PIOS_SENSOR_RATE` is 500 Hz, so a DroneCAN gyro would
+consume three quarters of the bus and still fight the existing traffic for
+arbitration. The gyro belongs on local SPI. Slow sensors are free - a 20 Hz
+baro would cost ~0.3 %.
+
 ## USB host port works — and `usb33` is a RED HERRING
 
 The USB-A host port enumerates normally:
@@ -371,35 +497,63 @@ and the vector direction is consistent. Fine for **relative** vibration work,
 which is this device's documented role; it would need calibration before any
 absolute use.
 
-## The GPS's IST8310 will NEVER appear - the AP_Periph build has no such driver
+## What the Matek L431's I2C port CAN and CANNOT drive
 
-Chased as a wiring fault; it is not. ArduPilot's hwdefs for BOTH Matek nodes
-(`MatekL431-Periph`, `MatekL431-GPS`) compile in exactly two compass backends:
+From `MatekL431-Periph/hwdef.dat` - the same authority that settled the
+IST8310 question:
 
-    COMPASS RM3100   SPI:rm3100  false ROTATION_PITCH_180_YAW_90
-    COMPASS QMC5883L I2C:0:0xd   false ROTATION_PITCH_180_YAW_90
-    define HAL_COMPASS_MAX_SENSORS 1
+    define AP_PERIPH_GPS_ENABLED 1      define AP_PERIPH_MAG_ENABLED 1
+    define AP_PERIPH_BARO_ENABLED 1     define AP_PERIPH_AIRSPEED_ENABLED 1
+    define AP_PERIPH_BATTERY_ENABLED 1
+    BARO    SPL06     I2C:0:0x76
+    COMPASS QMC5883L  I2C:0:0xd
 
-So node 124 probes I2C **0x0D** for a QMC5883L. An IST8310 answers at **0x0E**
-and has no driver in the image - correctly wired, it still never replies.
-`HAL_COMPASS_MAX_SENSORS 1` is why there is a single `COMPASS_DEV_ID` and no
-`_DEV_ID2/3`.
+**There is NO `AP_PERIPH_IMU_ENABLED` and no IMU driver of any kind** - no
+AP_InertialSensor, no MPU/ICM/Invensense. So an **MPU9150 on that JST port is
+invisible**, exactly like the IST8310, and for the same reason: no code to
+talk to it. Rebuilding AP_Periph with IMU support would still be the wrong
+transport - measured on this bus, RawIMU at 500 Hz costs 74 %.
 
-Evidence that it is NOT wiring or boot ordering, all measured:
-`COMPASS_ENABLE=1`, `COMPASS_DISBLMSK=0`, a full `RestartNode` of node 124 with
-everything powered, and still `COMPASS_DEV_ID=0` with zero mag messages - while
-node 125's RM3100 publishes 25 Hz throughout. The user confirmed a 6-pin
-(UART3+I2C) cable, which killed the wiring theory outright.
+**CORRECTED 2026-08-15 against the shipped build's own `features.txt`** (from
+https://firmware.ardupilot.org/AP_Periph/latest/MatekL431-Periph/, commit
+a824813): the earlier claim here that "the driver list is exact: SPL06, not
+MS5611, BMP280 or anything else" was WRONG. It was inferred from the hwdef's
+`BARO SPL06 I2C:0:0x76` line, which declares the ONBOARD baro - not the set of
+drivers compiled in. The real list is broad:
 
-**Method lesson, the same one as the ECM/dwc2 case:** the plausible physical
-explanation (cable) was pursued ahead of the cheap authoritative one (read the
-firmware's hwdef). Check what the software can *possibly* do before theorising
-about wires.
+    AP_BARO_BMP280_ENABLED   AP_BARO_BMP388_ENABLED   AP_BARO_BMP581_ENABLED
+    AP_BARO_MS5611_ENABLED   AP_BARO_MS5607_ENABLED   AP_BARO_MS5637_ENABLED
+    AP_BARO_SPL06_ENABLED    AP_BARO_DPS280_ENABLED   AP_BARO_FBM320_ENABLED
+    AP_BARO_BMP085_ENABLED   AP_BARO_LPS2XH_ENABLED
+    AP_BARO_PROBE_EXTERNAL_I2C_BUSES   <- probes external buses too
 
-**Do not "fix" this.** The RM3100 already on the bus is the better sensor by an
-order of magnitude (12.2 nT quantisation measured, vs ~300 nT for an IST8310).
-Adding IST8310 support means rebuilding and reflashing AP_Periph for a
-redundant, worse compass.
+So the L431 CAN drive an MS5611, a BMP280 or a BMP388 on its I2C port. The
+GY-63 would have worked there. Read `features.txt` from the firmware server
+before claiming what a build supports - the hwdef alone does not say.
+
+**SUPERSEDED - put the baro on the board's own I2C instead.** There is no such
+thing as a standalone DroneCAN barometer to buy (baro is always bundled into a
+combo node - mRobotics KitCAN, Beyond Robotix AUAV, CubePilot Here 2), the
+L431 route would need an SPL06 specifically, and the MS5611 already on the
+bench needs no purchase at all. It also has a driver in this very tree:
+`flight/pios/common/pios_ms5611.c`, 486 lines, I2C addr 0x77, already used by
+the coptercontrol/oplinkmini targets. Wire it to `/dev/i2c-3` alongside the
+MPU9150.
+
+So: **gyro goes on the board's own I2C/SPI, baro goes on the CAN node.** Fast
+and latency-critical local; slow and latency-tolerant over CAN.
+
+## CLOSED — ignore the IST8310 entirely
+
+The GPS board carries an IST8310 that this setup will never use, and it is
+**not a problem to solve**. The AP_Periph image compiles only RM3100 and
+QMC5883L backends with `HAL_COMPASS_MAX_SENSORS 1`, so a correctly wired
+IST8310 still never replies. That is settled; do not re-diagnose it, do not
+rebuild AP_Periph for it.
+
+**The mag we actually use is the RM3100 on node 125** — better by an order of
+magnitude (12.2 nT quantisation vs ~300 nT) and already publishing at 25 Hz.
+If a magnetometer question comes up, it is about node 125, not the IST8310.
 
 ## DONE: fw_simposix builds and runs on OpenSTLinux, fed by REAL sensors
 
@@ -464,3 +618,872 @@ EXIT=0. The one genuine portability bug found was in
 `#ifndef __cplusplus` guard. macOS hides this because its system headers define
 TRUE/FALSE; glibc does not, so it only appears when building for Linux. Nothing
 architecture-specific about it.
+
+## MEASURED: SCHED_FIFO is the difference between flyable and not
+
+The FreeRTOS Posix port makes every task a pthread, so each task wake-up
+inherits the host scheduler's latency. Measured with `rt_jitter.c` (C, not
+Python — an interpreter's overhead would be indistinguishable from scheduler
+latency), `clock_nanosleep(TIMER_ABSTIME)` on `CLOCK_MONOTONIC`, `mlockall`
+held, 10 000 wake-ups at 500 Hz = `PIOS_SENSOR_RATE`. "Critical" is the
+firmware's OWN threshold: `innerloop.c` calls 3 missed gyro updates critical.
+
+| configuration                     | worst late | vs period | >3 periods |
+|-----------------------------------|-----------:|----------:|-----------:|
+| SCHED_OTHER, idle                 |  18.254 ms | 9.1x      | 0.310 %    |
+| SCHED_OTHER, 2 busy cores         |  18.625 ms | 9.3x      | 5.400 %    |
+| **SCHED_FIFO 50, idle**           | **0.212 ms** | 0.1x    | **0 %**    |
+| **SCHED_FIFO 50, 2 busy cores**   | **0.233 ms** | 0.1x    | **0 %**    |
+| SCHED_FIFO 50 + performance gov   |   0.244 ms | 0.1x      | 0 %        |
+
+Two things follow, and only two:
+
+1. **At default priority this cannot fly.** An 18 ms stall is 9 missed gyro
+   samples; 0.31 % of periods breach the firmware's own critical threshold
+   even with the machine IDLE. Under load it is 5.4 %.
+2. **`chrt -f 50` fixes it completely** — 78x better tail, zero breaches, and
+   it does NOT degrade under a fully loaded machine. This is the single
+   highest-value change on the board and it is one word on a command line.
+
+The `ondemand` -> `performance` governor made no measurable difference: the
+A7s were already pinned at 650 MHz (`scaling_cur_freq` reads 650000 either
+way). Do not bother; it is not the lever.
+
+### TRAP: do not fork() load children from a SCHED_FIFO parent
+First run showed 12 SECONDS of lateness under FIFO+load, which is nonsense.
+Cause: `fork()` inherits the scheduling policy, so the busy children were also
+FIFO 50, and FIFO is run-to-completion — they never yielded, and the measured
+loop only ran when the kernel's RT throttle (`sched_rt_runtime_us` 950000 of
+1000000) forced a break. 12 s of starvation per 20 s run is exactly that 95 %
+duty. `rt_jitter.c` now drops children to SCHED_OTHER explicitly.
+
+The artifact carries a REAL warning: once the flight code runs at RT priority,
+any FreeRTOS task that busy-loops or blocks starves every other task, because
+the Posix port already serialises tasks. RT throttling is then the only thing
+between you and a dead scheduler.
+
+## The FreeRTOS scheduler thread burns a whole core, always
+
+`ps` shows `Scheduler` at 98.5–104 % CPU permanently — that is the Posix port
+spinning, not the flight code working. On a 2-core board HALF the machine is
+gone the moment fw_simposix starts, before any sensor arrives. Budget for one
+core, not two, and keep the bridge on the other.
+
+## The real limit is the SENSOR PATH, not the scheduler
+
+With FIFO the scheduler contributes 0.2 ms of jitter. The transport
+contributes far more, and that is where a real-world flight argument has to be
+made:
+
+- firmware WANTS `PIOS_SENSOR_RATE` = 500 Hz gyro
+- MPU-9150 over I2C in the bridge is configured 200 Hz, and DELIVERED
+  4276 objects in 30 s = **142.5 Hz** — a 3.5x shortfall against what the
+  inner loop expects
+- every sample crosses: I2C read -> Python process -> UDP loopback -> UAVTalk
+  parse. Each hop adds jitter that `rt_jitter` does NOT capture.
+
+So: scheduling is a SOLVED problem here (one `chrt`). Sensor delivery rate and
+jitter are NOT, and no amount of RT priority fixes them.
+
+## CORRECTION: the UDP bridge is a Gazebo artifact, not the sensor path
+
+Do not measure "sensor latency" through `sensor_bridge.py`. That path
+(I2C -> Python -> UDP loopback -> UAVTalk) exists because Gazebo SITL needed an
+external physics producer. On real hardware the correct pipeline is:
+
+    I2C  -> PIOS driver -> UAVTalk        (gyro/accel, /dev/i2c-3)
+    CAN  -> PIOS driver -> UAVTalk        (GPS, mag, baro, and PWM OUT to motors)
+
+UAVTalk over UDP is one *consumer* of the output, and on Linux it does not even
+have to be UDP - a unix socket or shm IPC is available now. Any figure quoted
+from the bridge (e.g. the old "142.5 Hz gyro") measures the SITL scaffolding,
+NOT the board.
+
+## MEASURED: the gyro bottleneck is the I2C CLOCK, not FreeRTOS
+
+14-byte burst read of MPU-9150 `ACCEL_XOUT_H..GYRO_ZOUT_L` - the exact
+transaction a PIOS driver issues once per sensor period - from C on the board
+(`i2c_rate.c`), 5000 reads:
+
+| priority     | median | p99 | worst | blew the 2 ms budget |
+|--------------|-------:|----:|------:|---------------------:|
+| SCHED_OTHER  | 1740.7 us | 3184.8 us | 14755.6 us | 927 (18.54 %) |
+| SCHED_FIFO 50| 1679.3 us | 1802.5 us |  2034.2 us |   1 (0.02 %)  |
+
+**1.68 ms for one gyro read = 84 % of a 500 Hz period.** Cause: `/dev/i2c-3`
+(I2C5, `i2c@40015000`) has NO `clock-frequency` in the DTB, so the stm32f7-i2c
+driver falls back to the **100 kHz** default. Only i2c-4 (`5c002000`, the PMIC
+bus - unusable for sensors) was given 400000.
+
+The arithmetic confirms it exactly, so this is not a guess:
+- reg-write txn: START + addr(9b) + reg(9b) + STOP ~ 20 bits ~ 200 us
+- read txn: START + addr(9b) + 14x9b + STOP ~ 137 bits ~ 1370 us
+- + inter-transaction gap = **~1.68 ms measured**. At 400 kHz: **~420 us**.
+
+### The fix (staged, needs a reboot to take effect)
+`fdtput` adds the one missing property; `dtc` is in ST's feed as `dtc dtc-misc`
+(NOT `device-tree-compiler`, and `apt` needs a sane PATH or dpkg errors):
+
+    fdtput -t i <dtb> /soc/i2c@40015000 clock-frequency 400000
+
+Verified minimal: 449 nodes before and after, identical dtc warning set (8),
+and the ONLY dts diff is the added line. On the board:
+- `/boot/stm32mp157c-osd32mp1-red-v1_2.dtb.orig` - untouched backup
+- `/boot/stm32mp157c-osd32mp1-red-v1_2.dtb.400k` - patched, NOT yet installed
+
+Expected after: ~420 us/read = 21 % of a 2 ms period, i.e. transport stops
+being the constraint.
+
+## Reference point: STM32F4 uses SPI, and that is the real gap
+
+OpenPilot Revolution reads the MPU6000 over **SPI at ~10 MHz**, not I2C. A
+14-byte burst there is ~15 us - about 0.75 % of a 500 Hz period. So:
+
+| path                          | per read | % of 2 ms |
+|-------------------------------|---------:|----------:|
+| STM32F4 + SPI (Revolution)    |   ~15 us |    0.75 % |
+| OSD32MP1 + I2C @ 400 kHz      |  ~420 us |      21 % |
+| OSD32MP1 + I2C @ 100 kHz (now)| ~1680 us |      84 % |
+
+`/dev/spidev0.0` EXISTS on this board. If STM32F4-class sensor rates are the
+goal, SPI is the answer - the gap is bus choice, not the FreeRTOS ELF port.
+
+## Bottom line for "is the FreeRTOS ELF translation realtime enough"
+
+Ranked by actual contribution to a 2 ms budget:
+1. **I2C at 100 kHz - 84 %** <- the real problem, one DTB property
+2. Scheduler at SCHED_OTHER - up to 18 ms <- fixed, one `chrt`
+3. FreeRTOS Posix port overhead - 0.2 ms worst case <- not the problem
+
+The ELF/FreeRTOS translation is the SMALLEST term. Do not tune it first.
+
+
+## THE MAGNETOMETER IS NODE 125 (RM3100), 25 Hz — it has always worked
+
+This was already recorded under "SETTLED: DroneCAN bring-up" above and was
+STILL asserted to be missing later in the same session. If you are about to
+write that there is no magnetometer, re-read this file first.
+
+Do not repeat this mistake. It was asserted here that the board "has no working
+magnetometer at all". **That is wrong**, and it was wrong because two separate
+facts got merged into one:
+
+1. a silent bus (the allocator was not running) was read as a missing sensor
+2. a closed, irrelevant question about a DIFFERENT part on the GPS board was
+   allowed to stand in for "is there a magnetometer at all"
+
+Node **125** publishes magnetic field at **25 Hz** and is healthy. That is the
+magnetometer. Nothing else needs considering.
+
+Verified on the wire:
+
+    node 125  msg type 1001  25.1 Hz  dlc=7
+    raw b22f66b4a036d1
+    B = (+0.1202, -0.2749, +0.4141) Ga   |B| = 0.5113 Ga = 51.1 uT
+
+Earth's field is 0.25-0.65 Ga, so the magnitude itself is the proof, and it is
+stable to 4 decimal places across consecutive samples.
+
+**Payload layout (determined empirically, not from a DSDL table):** three
+`float16` Gauss values starting at **offset 0** — there is **NO `sensor_id`
+byte**. Parsing it as `uint8 sensor_id + float16[3]` yields a constant
+`+17120.0000 Ga` on X and a "sensor_id" that changes every message. If a field
+that should be constant is varying, the alignment is wrong — do not explain the
+number, re-derive the offset.
+
+    x, y, z = struct.unpack("<eee", payload[0:6])   # payload = frame[:dlc-1]
+
+### The trap that caused the wrong conclusion
+
+**A silent CAN bus almost always means the allocator is not running, not that
+the hardware is absent.** After any reboot:
+
+- `can0` comes up DOWN, and `ip` is not on root's default PATH
+- nothing has a node ID, so every node sits broadcasting anonymous allocation
+  requests and publishes no sensor data at all
+- a bridge run in that state reports `mag: 0` AND `gps: 0` — which is what a
+  dead bus looks like, not a missing sensor
+
+`mag: 0` together with `gps: 0` is a bus-level symptom. Only `mag: 0` with GPS
+alive would point at the magnetometer. Check the allocator before concluding
+anything about a sensor.
+
+**Anonymous frames use a different ID layout** (2-bit type + 14-bit
+discriminator, not a 16-bit type), so decoding `(cid >> 8) & 0xFFFF` on a
+node-0 frame yields garbage - the "12537" seen during this debugging session
+was exactly that. Skip `node == 0` frames when counting message types.
+
+## THE INSTRUMENTATION LIED AGAIN — read the RAW log before diagnosing
+
+A "fw_realposix hangs after ~2 seconds" diagnosis was chased through three
+wrong hypotheses (signal stealing, SCHED_FIFO inheritance, stack overflow)
+before the raw log showed the firmware had been running correctly the entire
+time. Both artifacts are generic and will recur:
+
+1. **The firmware's stdout is BLOCK-buffered into a pipe.** Not a TTY, so libc
+   uses 4 KB full buffering instead of line buffering. Output arrives in
+   bursts with clustered timestamps, so `journalctl --since "-30s"` returns
+   NOTHING while the process is perfectly healthy. Use `stdbuf -oL`, or judge
+   by content rather than by time window.
+2. **USER_HZ tick deltas round small loads to zero.** `/proc/PID/task/*/stat`
+   counts in 10 ms units. A task at 0.3 % CPU uses ~1.5 ticks per 5 s, which
+   reads as "0 ticks = stopped". It is below the resolution, not stopped.
+
+What the raw log actually said, and what should have been checked first:
+
+    innerloop.c watchdog: gyroupdates=1 rateupdates=-1   <- outer loop RUNNING
+    innerloop.c PERIODIC: gateOpen=1
+    [althold] posDown=-0.0344 velDown=-0.1146 dT=0.00252 <- 2.5 ms, live
+    UAVObj event stats: eventCallbackErrors=0 eventQueueErrors=0
+
+`rateupdates` at **-1** instead of the **-64** floor is the single most useful
+health signal here: -64 means the outer loop never ran at all.
+
+This is the THIRD time in this project a measurement rather than the system
+produced the bug (the others: "guidance variance" that was a 9 Hz sampling
+loop, and CAN "50 Hz / 295 % jitter" that was frames counted as transfers).
+The pattern is always the same - a derived metric was trusted over the raw
+evidence. Read the log. Then measure.
+
+
+## CONFIRMED from the shipped build: what MatekL431-Periph can and cannot do
+
+Source of truth is the build's own `features.txt`, not the hwdef and not
+inference - fetched from
+https://firmware.ardupilot.org/AP_Periph/latest/MatekL431-Periph/
+(commit a824813, 2026-08-14). A leading `!` means DISABLED.
+
+**Compass - two backends, and only two:**
+
+    AP_COMPASS_RM3100_ENABLED       <- what node 125 actually uses
+    AP_COMPASS_QMC5883L_ENABLED
+    !AP_COMPASS_IST8310_ENABLED     <- confirms the IST8310 can NEVER appear
+    !AP_COMPASS_HMC5843_ENABLED     <- so an HMC5883L needs a REBUILD
+    !AP_COMPASS_DRONECAN_ENABLED
+
+This settles two long-running questions with the vendor's own artifact rather
+than with reasoning: the IST8310 is genuinely absent from the build, and
+putting an HMC5883L on the L431's I2C port requires recompiling AP_Periph
+(HMC5843 is the driver that covers the HMC5883L).
+
+**IMU - none, as suspected:**
+
+    !AP_PERIPH_IMU_ENABLED
+
+No inertial sensor support of any kind, which is why an MPU9150 on that port
+is invisible. Independently, the bus economics forbid it anyway: RawIMU at
+500 Hz measures 73.9 % of a 1 Mbit bus.
+
+**Baro - broad, see the correction above.** This is where the earlier
+inference was wrong.
+
+## SOLVED: vendor 20003 is `ardupilot.gnss.Status` — and ARMABLE is a real gate
+
+Identified by looking it up, not by shape-matching. ArduPilot's vendor DSDL
+lives in the dronecan/DSDL repo under `ardupilot/`, and the filenames carry
+the IDs:
+
+    ardupilot/gnss/20002.Heading   20003.Status   20005.MovingBaselineData
+                   20006.RelPosHeading
+    ardupilot/indication/20000.SafetyState  20001.Button  20007.NotifyState
+
+`20003.Status.uavcan`:
+
+    uint32 error_codes      bits  0-31
+    bool   healthy          bit   32
+    uint23 status           bits 33-55        = 56 bits = 7 bytes
+
+Seven bytes is exactly the payload length observed, which is the first check
+that the identification is right. DroneCAN packs LSB-first, so `healthy` is
+bit 0 of byte 4 and `status` is the top 7 bits of byte 4 plus bytes 5-6.
+
+Decoded live from node 124, indoors with no fix:
+
+    err=0x00000000  healthy=1  ARMABLE=0  LOGGING=0  raw=0x000040
+
+**`STATUS_ARMABLE` is the flight-safety bit**: the GPS node's own judgement
+that the system is fit to arm. Here it reads healthy hardware CORRECTLY
+refusing to bless an arm, because there is no fix. **Do not treat `healthy`
+alone as permission to fly** - healthy describes the receiver, ARMABLE
+describes the solution.
+
+Bit 6 of `status` is set with no documented meaning; the DSDL explicitly
+leaves the remaining bits to the application, so the full 23-bit field is kept
+raw alongside the two named flags rather than discarded.
+
+The earlier decision to store this message's bytes RAW rather than guess a
+layout is what made the identification cheap and safe - the guessed version
+would have been wrong, exactly as it was for the magnetometer.
+
+## OPEN BUG, rigorously bounded: realposix low-priority task starvation (2026-08-16)
+
+**fw_realposix: every FreeRTOS task at priority <= +6 permanently stops 2-20 s
+after start.** The +7 band (TelTx, UDP_Rx x2) and all raw pthreads keep
+running normally, so it looks like selective task death, never a crash.
+Reproduces 100 %: SCHED_OTHER and FIFO, pinned and unpinned, single clean
+instance. fw_simposix idle does not stall; bridge-fed simposix (142 Hz,
+inbound over UAVTalk) never showed it in 30 s windows.
+
+**Proven with gdb + /proc, not inferred:**
+- frozen tasks sit in `event_wait` beneath `vPortYield` beneath
+  `xQueueSemaphoreTake(xTicksToWait=10)` - 10 ms timeouts parked for minutes
+- their voluntary ctxt-switch counters freeze DEAD (Sensors: 449 total, then
+  +0 over any window) while TelTx does ~456/s and UDP_Rx ~1000/s
+- SigBlk map is the port's normal signature (exactly one unmasked thread)
+- `uxSchedulerSuspended = 0`
+
+**NINE hypotheses tested and disproven** (each by experiment, in order):
+journald pipe blocking; stdout buffering as the stall; hub stealing signals
+(masked - no change); SCHED_FIFO inheritance (fixed, real bug, not this);
+Sensors stack overflow (8 KB - no change); multi-instance contamination
+(REAL, fixed, still dies clean); SMP switch window (pinned to 1 CPU - still
+dies); tick-signal nesting in the event handshake (all three wait_for_event.c
+entry points now signal-masked - still dies); telemetry event flood from
+local 500 Hz Set() (metadata throttled to 1 Hz periodic - still dies).
+
+**TWO measurement artifacts that produced false conclusions, do not repeat:**
+- `gdb -batch` PAUSES the inferior: two `p xTickCount` reads with a sleep
+  between them read IDENTICAL values on a healthy system. The "tick died"
+  conclusion was this artifact.
+- journalctl accumulates across systemd-run reuses of one unit name - use a
+  FRESH unit name per test run, judge only by the t= wall-clock stamps inside
+  the log lines.
+
+**The environment traps that cost half the session (all fixed):**
+- the port renames the main thread comm to `Scheduler`, so
+  `pkill/pgrep -x fw_realposix.elf` match NOTHING - instances leak and fight
+  over UDP 9000 and I2C. Use `pgrep -x Scheduler`.
+- `fwsimposix.service` was enabled and auto-restarted; it is now DISABLED.
+  Never run both targets simultaneously - same ports.
+- `udp dev 0 - socket opened - result -1` in the log means the telemetry bind
+  FAILED (another instance holds it). It was in the log the whole time.
+
+**The next probe is a two-arm bisect, not a tenth guess:**
+1. realposix with the sensors.c publish branch disabled (hub reads, nothing
+   Set()s locally). Survives -> local Set() path is the trigger; dies -> the
+   hub/target delta is.
+2. simposix + sensor_bridge pushed to 500 Hz (not 142). Dies -> load-generic
+   port bug, nothing to do with realposix; survives -> realposix-specific.
+Also verify the metadata throttle actually took (read the metadata back) -
+test 9's negative is only valid if it did.
+
+## SOLVED: the realposix starvation was STDIO IN THE FLIGHT LOOPS (2026-08-16)
+
+The user called it in one sentence: "doing a printf in an RTOS loop seems
+silly." Root cause: printf/fflush in flight and driver loops = write()
+syscalls plus a PROCESS-WIDE stdio mutex, taken by FreeRTOS tasks at mixed
+priorities and raw pthreads alike. A low-priority task preempted WHILE
+HOLDING the stdout lock leaves every higher task to block NATIVELY on that
+mutex - invisible to FreeRTOS, which keeps selecting them as Ready - priority
+inversion with no inheritance, permanent because the holder is never
+scheduled again. Rate-dependent (2-20 s to hit), which is why idle simposix
+lived for days and 500 Hz realposix died in seconds. The earlier
+stdout-to-a-FILE test failed to exonerate stdio because the LOCK, not the
+pipe, is the weapon - it inverts identically wherever fd 1 points.
+
+Hypothesis #4 of the hunt WAS this and was wrongly discarded: "prints
+continued post-stall" - they came from the +7 band round-robining above the
+convoy. An objection must explain ALL the evidence before it kills a theory.
+
+**Fix (all three parts, per the user's prescription):**
+1. `PIOS_SHMLOG_Printf` - lock-free MPSC ring in `/dev/shm/ninjapilot-log`
+   (pios_shmlog.c): vsnprintf + a few atomics, NO syscall, NO shared lock,
+   drops-when-full rather than ever waiting. All 23 loop printfs rerouted,
+   all 22 `fflush(stdout)` calls removed from those paths.
+2. `shmlogd` (osd32mp1/shmlogd.c) - separate consumer process does the I/O;
+   `--dump` replays the ring POST-MORTEM, since /dev/shm survives a firmware
+   crash. It just proved itself: the verdict above was read from the ring
+   after the firmware had already been stopped.
+3. Single-instance flock pidfile in PIOS_SYS_Init - a second instance exits
+   with the running pid named (and the reminder that its comm is
+   "Scheduler"). No more leaked-instance contamination, ever.
+
+Proof: 242 watchdog lines over 121.5 s = 1.99/s against the 2/s design rate,
+full soak, `rateupdates=-1/-2` (outer loop RUNNING, was pinned at -64).
+Config identical to ten consecutive 2-20 s deaths.
+
+**RULE going forward: no stdio in any FreeRTOS task or driver loop on the
+Posix port. Diagnostics go through PIOS_SHMLOG_Printf. stdout is for init.**
+
+## GPS Fix2 DECODED (2026-08-16) - and two corrections that made it possible
+
+**CORRECTION: Fix2 is message 1063, not 1060.** The earlier bandwidth table
+labeled the 10-frame 5 Hz transfer "1060/Fix2"; the DSDL and a fresh wire
+census agree it is 1063 (1060 is the DEPRECATED Fix, not on this bus at all).
+Census: 1063 = 300 frames / 30 xfers / 6 s = 10 frames per transfer, 5 Hz.
+
+The decoder (pios_sensors_hub.c) implements DroneCAN v0 bit packing ported
+from libcanard's canardDecodeScalar semantics, NOT derived from reasoning:
+stream bits MSB-first per byte, partial tail byte right-aligned, assembled
+bytes little-endian, sign-extend at field width. Cross-checked against the
+already-working byte-aligned mag decode.
+
+**TRAP that cost one full test cycle: the reassembler needs EVERY frame, but
+can_poll filtered on the start-of-transfer bit BEFORE dispatch** - so Fix2
+only ever received first frames and silently never completed. Multi-frame
+message dispatch must sit ABOVE that filter. Silent rejection hid it; the
+reject path now logs the first three failures with field values.
+
+Validation, per the indoors protocol (lat/lon of zero cannot distinguish
+right offsets from wrong ones, so structure carries the burden): fix=NO_FIX
+matching gnss.Status ARMABLE=0, sats=0, bad=0 across every transfer, 5 Hz
+cadence, flight loops healthy alongside. **lat/lon remain UNVALIDATED until
+the first outdoor fix** - the decode gate rejects illegal enum/sat/leap
+values rather than publish plausible garbage. Published as
+GPSPositionSensor/GPSVelocitySensor with Status=NoFix, so filterlla's gates
+ignore the zeros rather than fusing them.
+
+Open diagnostics item: a SHMLOG line printing two %.1f doubles then %u shows
+garbage in the %u on armv7 (tstd=1616 from a 3-bit field that PASSED a >3
+gate - the decode is right, the print is wrong). Integer-only lines are
+clean. Suspect varargs handling after doubles; verify before trusting mixed
+float/int shmlog lines.
+
+Also: **shmlogd --dump CONSUMES the ring** (it is the consumer, not a
+viewer). Dump ONCE to a file and grep the file - a second dump reads empty.
+
+**GPS init answer:** the M8N needs nothing from us - AP_Periph runs ublox
+autoconfig itself, and the node publishing Fix2 at 5 Hz with healthy=1 proves
+the receiver is alive and talking. sats_used=0 on a desk is plausible for a
+bare M8N: no assistance data, cold almanac, indoor attenuation - a phone
+cheats with A-GPS. If it still shows 0 sats NEAR A WINDOW after ~15 min,
+suspect the antenna; decode gnss.Auxiliary (1061, 3 frames) for sats_visible
+to separate "sees nothing" from "uses nothing".
+
+## gnss.Auxiliary decoded - and the GPS verdict it delivered (2026-08-16)
+
+Fix2 carries only PDOP; HDOP/VDOP and **sats_visible** live in
+`gnss.Auxiliary` (1061, 3 frames, 5 Hz), now decoded through the generalized
+reassembler. GPSPositionSensor uses the real HDOP/VDOP once Auxiliary has
+arrived.
+
+The decode self-validates: HDOP and VDOP read **exactly 100.0** - the
+u-blox/AP "no solution" sentinel - at byte-aligned offsets. A coherent
+documented sentinel in the right position is strong evidence the field frame
+is correct, and Fix2's independent sats_used agrees with Auxiliary's.
+
+**The finding: sats_visible = 0.** Not "sees satellites but can't fix" -
+the RF front end is tracking NOTHING. A working M8N indoors typically shows
+a few visible sats within minutes even without fixing (a phone does better
+only because A-GPS cheats). Persistent zero VISIBLE points at
+antenna/RF - connector seated? patch facing sky? buried under bench metal? -
+not at receiver settings, which AP_Periph configures itself (healthy=1,
+5 Hz cadence proves comms). Definitive test: near a window, 15 min;
+sats_visible stays 0 -> antenna.
+
+## FLIGHT-READINESS SOAK: 360 s, graded GO (2026-08-16)
+
+`flight_readiness.py` grades a soak from the ring: [hub-health] checkpoints
+every 10 s (per-sensor deltas, MEASURED i2c busy-time, CAN bits from actual
+frame sizes) bucketed into 30/60/90/180/360 s windows against explicit
+thresholds. Result, 23,182 records, zero ring drops:
+
+    window     imu    baro  hmc   mag   gps  err  i2c%  can%  wd/s  verdict
+    0-30s      498.6  50.0  50.0  25.0  5.0  0    30.4  1.2   2.00  NO-GO outer*
+    30-360s    498.2+ 50.0  50.0  25.0  5.0  0    30.5  1.2   ~2.0  GO (all)
+
+*The 0-30 s "outer" flag is rateupdates touching -64 during filtercf's
+DELIBERATE startup calibration windows (4 s ERROR + 6 s CRITICAL, no attitude
+until init completes - documented in the main CLAUDE.md). Expected, not a
+fault. Every window after: GO on every criterion.
+
+Bottom line: sensors, buses and loops are flight-stable for 6 minutes
+continuous. I2C sits at 30 % busy, CAN at 1.2 %. The flyable envelope on
+this evidence: attitude / AxisLock / AltHold - no GPS modes until an outdoor
+fix validates lat/lon (and the antenna question is answered).
+
+### Ring lesson: it is DROP-ON-FULL, and that changes how you read it
+The writer never overwrites an unconsumed slot - it drops and counts. So the
+oldest valid record is ALWAYS at tail; "skip a lap back from head" logic
+belongs to overwrite rings and reads ZERO here (found live: head=12191,
+tail=0, dropped=8095, dump empty). And a post-mortem dump holds only the
+FIRST ring-full (~2 min at current rates): for long captures run shmlogd
+CONCURRENTLY into a file. Both now encoded in shmlogd itself.
+
+## BMP388-on-L431: software exonerated, wiring/hwdef under suspicion (2026-08-16)
+
+The baro was moved to the L431 Periph's I2C port and does NOT appear on CAN.
+The software gates are now FULLY open, so stop re-checking them:
+- `BARO_PROBE_EXT` was 0 (the predicted gate), set to 1024, PROVEN to persist
+  across reboot, then set to 16383 - every probe bit, all eleven compiled
+  baro drivers - saved ok, node restarted twice, publishes its GPS suite fine.
+- Still zero StaticPressure/StaticTemperature (1028/1029) on the wire.
+
+Remaining suspects, in order: (1) wrong JST (the 6-pin is UART3+I2C combined,
+the CAN daisy ports probe nothing), (2) SDA/SCL mapping - Adafruit silk says
+SDI/SCK which ARE SDA/SCL in I2C mode, (3) the hwdef may mark the L431's only
+I2C bus INTERNAL, in which case BARO_PROBE_EXT skips it regardless of mask -
+a gate no parameter opens. The deterministic fix for (3) is a one-line custom
+hwdef build: `BARO BMP388 I2C:0:0x77` declared, not probed.
+Re-prove the sensor itself on the MP1 bus (probe_sensors.py) before deeper
+theories - it worked there an hour before the move.
+
+## FIXED PERMANENTLY: the "allocator keeps dying" mystery
+
+`dronecan_allocator.py` never died - it is a SESSION TOOL that exits after
+printing its report. Every mysterious allocator death was it completing
+normally, and every silent bus after a node reboot was this. Replaced by
+`allocatord.py` + `dronecan-allocator.service` (systemd, Restart=always,
+enabled, brings can0 up itself). Nodes now get IDs within seconds of any
+power-up, unattended. The session tool remains useful for its REPORT.
+
+## PROVEN: L431 firmware flashes over CAN, and recovery from a failed flash is REAL (2026-08-16)
+
+Full over-CAN update of node 124, stock MatekL431-Periph image, 212,568 bytes
+served by our own dronecan FileServer in ~124 s (~1.7 KB/s):
+
+    BEFORE  sw 1.7  vcs=9c6f307f
+    AFTER   sw 1.9  vcs=e0652af4   (exactly the upstream commit downloaded)
+
+**The recovery guarantee was tested LIVE, by accident:** our file server
+crashed mid-handshake on the first attempt, after the node had already
+committed to updating. The bootloader sat on the bus in mode 3 (SW_UPDATE)
+waiting to be fed - node fully recoverable - and a re-attached server plus a
+fresh BeginFirmwareUpdate completed the flash. The bootloader region is never
+written by a CAN update, so the worst case is a waiting bootloader, not a
+brick. SWD pads remain the absolute fallback.
+
+Parameters SURVIVE the app update (BARO_PROBE_EXT read back 16383 on 1.9).
+
+**Three dronecan-python traps, each cost one attempt** (`can_flash.py` embeds
+all three fixes):
+1. `node.spin()` RAISES TransferError on wire noise - an unhandled one kills
+   your file server mid-flash. Wrap every spin.
+2. Request callbacks receive **None on timeout** - guard before appending.
+3. Run the flasher as a fixed node id (126 here) that collides with nothing:
+   127 is the resident allocator.
+
+Baro postscript: even on 1.9 with all probe bits, still no StaticPressure -
+two firmware versions, four reboots, every driver probing. The BMP388's
+connection to the L431 (or the hwdef marking its I2C bus internal) is the
+remaining suspect set; software above the hwdef is exhausted.
+
+## THE BARO ROOT CAUSE, and the custom-AP_Periph saga (2026-08-16)
+
+**ROOT CAUSE FOUND in the hwdef parent include** (MatekL431/hwdef.inc):
+
+    define HAL_I2C_INTERNAL_MASK 1
+
+The L431's ONLY I2C bus is declared INTERNAL, and BARO_PROBE_EXT probes
+external buses exclusively - so no parameter can ever reach that bus. All 14
+probe bits across two firmware versions were structurally inert. The fix is
+a DECLARED probe in a custom hwdef: `BARO BMP388 I2C:0:0x77` (patch:
+osd32mp1/ap-periph-ninja-debug.patch, which also adds the bench I2C scanner
+with SDA/SCL swap detection over debug.LogMessage, and trims airspeed+battery
+- net 17 KB freed, 27.8 KB flash headroom).
+
+**Build environment facts:** ArduPilot will not build under a path with
+SPACES ("/OP Revo Redux/" broke ChibiOS scripts -> moved to ~/ardupilot);
+hwdef changes need `waf configure` RERUN or you get a byte-identical binary
+and a 2-second "success"; empy's import name is `em`; shallow clones build
+with vcs_commit=0.
+
+**Custom image did NOT boot; stock re-flash also now holds in bootloader.**
+Identity trap that cost an hour: anything answering GetNodeInfo with
+`sw 2.0 vcs=00000000 mode=MAINTENANCE vendor=0xd` is the BOOTLOADER (BLs are
+built without git info; the app reports available_memory as vendor code -
+13 bytes free is impossible for a running app). The app descriptor in our
+bin is VALID (magic at 0x1d0, CRCs populated, size exact), so rejection is
+not structural. Suspects, in order: (1) a bootloader boot-failure hold flag
+that a POWER CYCLE clears - untested at session end; (2) gcc 13.3 - AP's
+blessed toolchain is gcc 10.2.1, and a miscompiled app that faults before
+feeding the watchdog would hold the BL exactly like this; (3) our bin is not
+8-byte aligned (193372 % 8 = 4) on a dual-word-programming L4 - stock is
+aligned. Next session: power-cycle first, then rebuild with gcc 10.2.1
+before ANY other theory.
+
+Recovery machinery held throughout: the bootloader stayed reachable and
+reflashable over CAN through every failed attempt - the floor never dropped
+below "waiting bootloader".
+
+## RESOLVED: gcc 13.3 was the boot-killer; the custom hwdef WORKS (2026-08-16)
+
+Suspect (2) from the saga above was the answer. The IDENTICAL source built
+with **gcc 10.2.1** (arm-gnu 10-2020-q4-major, AP's blessed toolchain,
+installed at `~/gcc-arm-none-eabi-10-2020-q4-major/bin` on the Mac — prepend
+to PATH before `./waf configure`) flashed over CAN and booted first try:
+mode 3 (SW_UPDATE) -> 1 (INITIALIZATION) -> 0 (OPERATIONAL). Power-cycle
+(suspect 1) had already been ruled out; alignment (suspect 3) never needed
+testing. **Rule: build AP_Periph for the L431 ONLY with gcc 10.2.1.** A
+gcc 13.3 image holds the node in the bootloader indefinitely — recoverable,
+but a guaranteed dead flash.
+
+With the custom hwdef running, the HAL_I2C_INTERNAL_MASK root cause is
+CONFIRMED by outcome — the declared `BARO BMP388 I2C:0:0x77` probe found the
+sensor immediately:
+
+    node 124  msg 1028  StaticPressure     50.05 Hz   98573.6 Pa = 98.57 kPa
+    node 124  msg 1029  StaticTemperature  50.00 Hz
+    (full GPS suite intact: Fix2/Aux/20003 at 5 Hz; node 125 mag 25 Hz)
+
+98.57 kPa agrees with what the SAME BMP388 read on the MP1's own I2C bus
+before the move (98.6-98.7) — sensor, wiring, and firmware all vindicated at
+once. The I2CDBG scanner in the patch stays correctly SILENT because the baro
+is healthy; it only sweeps when `!baro.healthy()`. Known-good binary saved as
+`osd32mp1/fw/AP_Periph-ninja-gcc10.bin` (195,244 bytes; patch:
+`osd32mp1/ap-periph-ninja-debug.patch`).
+
+**The hub consumes it**: pios_sensors_hub.c decodes 1028 (float32 Pa,
+single frame, sanity 30-120 kPa) and 1029 (float16 Kelvin) into the same
+snapshot fields the local-I2C BMP388 used, so sensors.c publishes BaroSensor
+unchanged. Verified live: hub-health `baro=500`/10 s = 50 Hz from CAN, zero
+errors, can_pm 23 (2.3 % bus with baro added), flight loops healthy
+(rateupdates -2). The baro's migration MP1-I2C -> L431-CAN is COMPLETE and
+freed ~25 % of the MP1 I2C bus budget (was 30.5 % busy with three devices).
+
+## Second MPU-9150 on the L431: detected, publishing — and THREE traps (2026-08-16)
+
+The IMU itself was the easy part: `IMU Invensense I2C:0:0x68` + 
+`AP_PERIPH_IMU_ENABLED 1` in the custom hwdef, and the AP driver accepts
+WHO_AM_I 0x68 (MPU-9150 = MPU-6000-compatible core; the driver does the
+reset/wake itself). RawIMU (1003) publishing gated on `INS_SAMPLE_RATE`
+(default 0 = thread never starts). Verified live: **47.6 Hz, 476/476
+transfers complete, |a| = 1.044 g, gyro zero-mean sd < 0.008 rad/s**, with
+baro at 50 Hz and the full GPS suite at 5 Hz alongside.
+
+Getting there hit three traps, each of which looked like something else:
+
+**1. RawIMU at 200 Hz MELTS the node — pool starvation, not bandwidth.**
+7 frames/transfer × 200 Hz floods the L431's 4 KB canard pool, which is
+SHARED between TX and RX. Signature: start-frames on the wire with the tails
+missing (zero completable transfers), baro collapsing 50→5 Hz, NodeStatus
+0.1 Hz — and the node goes DEAF, because inbound param/restart/Begin
+requests need pool blocks too. 90 single-frame requests over 45 s: all
+eaten. Software-only recovery is impossible at that point.
+
+**The recovery that works — the power-cycle ambush**: spam
+`BeginFirmwareUpdate` continuously while the node power-cycles; the app's
+~1 s init calm (before the IMU thread starts) hears it and reboots into the
+bootloader, parked. Recipe in SKILLS.md. Publish rate is now CLAMPED to
+50 Hz in code (imu.cpp + AP_Periph.cpp) so a bad saved param can never
+re-create the storm. High-rate gyro-over-CAN needs the single-frame vendor
+message (1 frame/sample), not RawIMU.
+
+**2. "The new firmware won't boot" was the INS no-IMU PANIC.** Every image
+flashed after the MPU was unplugged held in the bootloader — three
+deliveries, md5-verified, all blamed on delivery/toolchain/pool. The real
+cause: `defaults_periph.h` sets `AP_INERTIALSENSOR_ALLOW_NO_SENSORS` to
+`AP_PERIPH_IMU_ENABLED`, which compiles in
+`AP_HAL::panic("INS needs at least 1 gyro and 1 accel")` — boot, probe
+empty bus, panic, reset, BL hold. Indistinguishable from a dead flash from
+the wire. Fixed: the default is now #ifndef-guarded and the hwdef sets it
+to 0 — the node boots and publishes the rest of its suite when the IMU is
+absent. **When a flash "fails", ask what the app does in its first 100 ms.**
+
+**3. NodeStatus bit positions: health is (b[4]>>6), MODE is (b[4]>>3)&7.**
+A watcher decoding `>>6` as "mode" read the bootloader's health=OK as
+mode=OPERATIONAL and blessed a dead node. The BL also answers GetNodeInfo
+DURING the boot transition, so a flasher sampling right after completion
+prints the BL identity even when the app boots fine a second later — judge
+by mode + the sensor suite publishing, never by one GetNodeInfo.
+
+## Per-sensor rate knobs, the compact IMU stream, and DEGRADEDHZ (2026-08-16, late)
+
+Node 124 now carries live-tunable CAN parameters (set over the wire, no
+reflash): `INS_SAMPLE_RATE` (compact IMU stream, 1-200 Hz), `IMU_RAW_RATE`
+(RawIMU 1003, 0-200, **0 disables it** - halves the bus), `BARO_MAX_RATE`
+(0 = native 50 Hz, else a cap - proven live: 10 -> 9.2 Hz measured), plus
+stock `GPS1_RATE_MS` (200 ms = 5 Hz; the M8N takes 100 for 10 Hz).
+
+**The compact stream** replaces RawIMU for rate: two vendor SINGLE-FRAME
+messages, no multi-frame tails to lose:
+
+    20500  gyro   int16[3] LE, rad/s * 1000    (6 bytes, 1 frame)
+    20501  accel  int16[3] LE, m/s^2 * 500     (6 bytes, 1 frame)
+
+Verified at 186 Hz with the full suite intact (890 fr/s total, all clean).
+NOT yet decoded by the realposix hub - that is the next task; scaling above
+is the contract.
+
+**DEGRADEDHZ guardrail** (user-specified): sustained compact-TX failures
+throttle the IMU streams back to defaults and latch bit 15 of the NodeStatus
+vendor code until reboot. It works - and it FALSE-TRIPPED at boot on its
+first flight, because broadcasts fail while the node is still anonymous
+(allocation takes seconds): a 15 s boot grace now covers that. The latch and
+throttle were proven BY the false trip: knob writes landed but rates stayed
+pinned at 50, exactly as designed.
+
+**Ramp-test findings (the real envelope):**
+- compact 200 + raw 50  = ~890 fr/s: everything clean. THE operating point.
+- raw >= 100: the L431 collapses its own output and the whole WIRE degrades
+  (node 125's mag drops too; MP1 controller goes ERROR-WARNING). This is a
+  wire-level error storm, NOT pool exhaustion - canard_broadcast keeps
+  returning true (queued != transmitted), so the TX-failure guardrail never
+  fires. Next guardrail iteration needs a wire-error or queue-depth signal.
+- The MP1's OWN RX path caps around ~155 delivered fr/s during error storms
+  (kernel counters agree with userspace - the loss is real, in the
+  controller). Do not diagnose node health through a storming bus.
+- Recovery: reboot node 124 (rates reload from saved params) - the wire
+  clears immediately. can0 down/up on the MP1 is blocked by allocatord
+  holding the interface; not needed anyway.
+
+**BUILD RULE that cost two dead images: after ANY Parameters.h / k_param
+change, `rm -rf build/<board>` and full configure+build.** Two consecutive
+incremental builds produced images that flashed, CRC-verified, and then
+either reset-looped silently or held in the bootloader; the identical source
+built clean booted first try. The ambush flasher recovers either way (it
+caught a reset-looping node in 2.9 s with no power cycle - the BL window
+recurs every watchdog reset).
+
+## realposix consumes the CAN IMU: hub decode + failover (2026-08-16, night)
+
+The hub decodes the compact stream (20500 gyro / 20501 accel, int16 LE at
+/1000 rad/s and /500 m/s^2) into `imu2_*` snapshot fields. The ACCEL message
+owns the counter - the node sends gyro-then-accel back to back, so accel
+arrival marks a complete pair and sensors.c publishes on it. Verified live:
+`[hub-health] ... imu2=1862/10s` = 186 Hz through the hub with every other
+sensor untouched (local imu 496 Hz, baro 50, mag 25, GPS 5, zero errors),
+outer loop recovered post-calibration (rateupdates -2).
+
+**Failover, not fusion**: the CAN IMU publishes GyroSensor/AccelSensor ONLY
+while the local I2C stream has been silent >200 ms (timestamps are both hub
+CLOCK_MONOTONIC, compared snapshot-internally - no clock read in the task),
+and stands down the moment the local sensor returns. Entry/exit are one-shot
+shmlog lines ("LOCAL IMU SILENT..." / "...stands down"). With both alive the
+CAN stream idles in standby - measured: failover lines 0 across the soak.
+The inner loop keeps closing at ~186 Hz on CAN if the local bus dies.
+
+Live pull-the-plug test still pending: unplug the LOCAL MPU-9150 (MP1
+`/dev/i2c-3`, addr 0x68) while fw_realposix runs and watch the failover
+line appear with gyroupdates staying alive.
+
+## MEASURED: the compact gyro stream CANNOT flood the bus - the node tops out first (2026-08-16)
+
+The rate walk the DEGRADEDHZ work was built for, run for real: bus silenced
+to the MPU streams (IMU_RAW_RATE=0, BARO_MAX_RATE=1; GPS's 70 fr/s cannot
+be muted without a rebuild), INS_SAMPLE_RATE walked 200 -> 400 in 5 Hz
+steps, three tripwires per step (delivered rate regression, node-125 mag
+canary, MP1 kernel overrun counter).
+
+**Result: NO FLOOD, anywhere.** Zero overruns across the whole walk, mag
+pinned at 25.0-25.5 Hz, wire peaking at 644 fr/s (~8 % of 1 Mbit). The
+delivered rate climbs sublinearly and saturates at **271.8 Hz** (asymptote
+~270, flat from commanded ~340 up). The ceiling is the L431's publish-loop
+CPU budget, not CAN: per-iteration overhead grows from ~330 us at 200 Hz
+toward ~1.2 ms at the top. Flooding the wire with single-frame pairs would
+take ~3,700 Hz - 13x beyond what the node can produce. The only proven
+wire-killer remains multi-frame RawIMU at >=100 Hz (error storm, see the
+ramp-test section).
+
+Practical envelope by stream, both measured:
+    compact pairs:  any rate you can ask for is bus-safe; 270 Hz delivered max
+    RawIMU:         50 Hz safe, >=100 Hz storms the wire
+
+**Degradation policy updated to spec:** a DEGRADEDHZ trip throttles the
+streams to defaults, but a NEW rate request made after the trip is honored -
+the throttle binds only to the param value active at trip time. The
+NodeStatus bit-15 flag still latches until reboot as the telltale. Verified
+live: post-"degradation" re-requests of 200 and 100 Hz delivered 188.8 and
+99.8 Hz immediately. Restored + saved operating point: 200/25, baro native.
+
+## M9N-5883 GPS swap + the 317 Hz gyro ceiling (2026-08-16, late night)
+
+**M9N GNSS: seen immediately, zero config.** The Matek M9N-5883 replaced the
+M8N on the L431's UART; AP_Periph auto-bauded and the full suite continued
+at exactly 5 Hz (Fix2/Aux/Status, healthy=1). Indoors still ARMABLE=0 with
+sats_visible=0 and the hdop/vdop=100.0 sentinel - NOTE: two different
+receivers with two different antennas now show zero VISIBLE sats at this
+bench, which shifts suspicion from "broken antenna" to "RF-dead bench
+location". The window test decides.
+
+**Its QMC5883L compass is NOT on the bus.** MAG was re-enabled in the
+firmware (the earlier mag-disable removed; stock QMC declared probe at
+0x0D; +4.4 KB, fits with 10 KB spare) - and COMPASS_DEV_ID still reads 0
+after a fresh boot-time probe, while the BMP388 (0x77) and MPU-9150 (0x68)
+on the SAME bus answer normally. The bus is proven; the part is absent:
+the M9N's DA/CL strand is not landing on the L431's SCL/SDA net. Check the
+6P cable pin mapping (Matek-to-Matek is not proof of 1:1 signal order)
+before any software theory.
+
+**Publish-loop push: 317 Hz delivered max, bus still bored.** Sleeping only
+the remainder of the period (wait_for_sample already blocks ~2.5 ms at the
+400 Hz init base) raised the ceiling 271.8 -> 317.0 Hz (cmd 390), wire at
+733 fr/s, ZERO overruns, mag canary flat. The residual gap to 400 is
+per-iteration work causing sample skips. KNOWN REGRESSION from this change:
+mid-range command tracking is gone - commands 200-375 all deliver ~265-270
+(sleep and sample-wait no longer stack). Fix queued: divider pacing -
+publish every Nth sample of the 400 Hz base for exact 400/N rates.
+Operating point saved at cmd 200 = ~263 delivered.
+
+## Divider pacing measured: the loop's TRUE base is ~316 Hz, and rates are 316/N (2026-08-16)
+
+The divider build (publish every Nth sample of the 400 Hz INS base, no
+sleeps) delivers exactly 79 % of every commanded rate:
+
+    cmd 400 -> 305.4    cmd 200 -> 157.8    cmd 133 -> 105.4    cmd 100 -> 79.0
+
+79 % everywhere = the base loop actually cycles at ~316 Hz, not 400: the
+per-iteration work (imu.update bookkeeping + two broadcasts) overruns the
+2.5 ms sample budget ~1 cycle in 5, and the divider divides the REAL base.
+So the achievable gyro rates on this node are ~316/N: 305-317, 158, 105,
+79... **Max sustained = ~305 Hz (317 peak), bus at 710 fr/s, zero overruns,
+mag canary flat - the wire remains a bystander.** Exact round rates (200)
+are unreachable by integer division of a 316 base; pushing the true base to
+400+ means trimming loop work or a 450-500 init base (500 = watchdog death,
+untested between). This is the L431's practical ceiling; more wants
+SPI-class hardware or a leaner node.
+
+**Bisect verdict on the dud image**: divider-only boots and runs (this
+build); the always-on-boot I2C sweep was in the image that held the BL
+through five deliveries. Do not re-add the unconditional sweep without
+investigating; the baro-unhealthy-gated sweep remains fine. Operating
+point saved: cmd 200 (=158 delivered), raw 25, baro native.
+
+## SOLVED: the M9N's "missing" compass is a QMC5883P at 0x2C, not a QMC5883L at 0x0D (2026-08-16)
+
+The detective chain, because each link mattered:
+- hwdef truth: the L431 runs ONE I2C peripheral (I2C2, PB13/PB14; I2C1's
+  pins are burned on USART1) and BOTH connectors (4-pin I2C JST, 6-pin GPS
+  combo) share that net - no hidden second bus, so "enable another bus" was
+  never the answer.
+- A PARAM-TRIGGERED I2C sweep (`I2C_SCAN=1`, one-shot, reports over
+  debug.LogMessage) replaced the always-at-boot sweep that had bricked an
+  image. Its report: `ACK 0x2C id[00]=80` - a live device at an address no
+  QMC5883L ever uses.
+- 0x2C + chip-id 0x80 is the QMC5883P - the successor die vendors quietly
+  ship on "5883"-branded modules. ArduPilot's SEPARATE AP_Compass_QMC5883P
+  driver expects exactly those constants. The wiring was perfect all along;
+  the firmware was probing 0x0D for a part that is not there.
+- Fix: `AP_COMPASS_QMC5883P_ENABLED 1` + `COMPASS QMC5883P I2C:0:0x2c` -
+  compass publishing at 25 Hz on the first boot after flashing.
+
+**Do not trust the part number on a "5883" module. Scan and read the ID.**
+
+Reading: bench |B| = 76 uT vs the RM3100's 51 - uncalibrated hard-iron
+offset (the M9N manual itself demands 10 cm from wiring). Calibrate before
+any heading use.
+
+**Hub fix that this forced**: node 124 and node 125 BOTH broadcast msg 1001
+now. The hub's mag decode is keyed to node 125 (the calibrated RM3100 = the
+flight mag); node 124's QMC lands in separate qmc_* snapshot fields,
+ingestion-only. Verified: hub-health `mag=250 qmc=249` per 10 s, zero
+errors. Side effect noted: the compass driver's I2C traffic on the L431
+costs the IMU loop ~10-15 % (compact stream ~142 Hz at the saved setting,
+was ~158).
+
+## The IST8310 is BACK - and the "CLOSED forever" ruling gets its epilogue (2026-08-16)
+
+The GPS swapped again: Holybro Micro M9N, whose compass is an IST8310. One
+I2C_SCAN answered everything in ninety seconds: `ACK 0x0E id[00]=0x10` =
+IST8310 at 0x0E, wiring straight (swapped probe empty), BMP388 and MPU
+still ACKing beside it.
+
+The old "CLOSED - the IST8310 can NEVER appear" ruling was true of the
+STOCK build (driver not compiled). We ship custom firmware now, so it was
+one hwdef line: `AP_COMPASS_IST8310_ENABLED 1` + `COMPASS IST8310
+I2C:0:0x0e`. Publishing at 25 Hz on first boot, **|B| = 46.9 uT** - inside
+Earth's range and agreeing with the RM3100's 51, unlike the QMC5883P's
+76 uT bench reading. The hub's node-keying (mag=125, everything else from
+124 into qmc_* fields) already handles it unchanged - the qmc_* name now
+means "node 124's aux mag", whatever module is plugged in.
+
+Both compass declarations stay in the hwdef (QMC5883P @0x2C, IST8310
+@0x0E): whichever GPS module is attached gets found at boot, the other
+probe fails silently. HAL_COMPASS_MAX_SENSORS=1 means first-found wins if
+both were ever present.
+
+Also observed post-scan (previous session): repeated `IERR 0x200000`
+LogMessages after a param-triggered sweep - the bit-bang stealing the I2C
+pins mid-driver leaves an internal-error latch that chatters until reboot.
+Cosmetic, clears on restart; scan, then reboot the node before trusting
+error counters.

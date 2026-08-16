@@ -57,6 +57,9 @@
 #include "airspeedsensor.h"
 #include "barosensor.h"
 #include "magsensor.h"
+#include "auxmagsensor.h"
+#include "gpspositionsensor.h"
+#include "gpsvelocitysensor.h"
 #include "gyrosensor.h"
 #include "flightstatus.h"
 #include "gpspositionsensor.h"
@@ -74,9 +77,29 @@
 #endif
 
 #include "CoordinateConversions.h"
+#ifdef PIOS_REALPOSIX
+#include <pios_shmlog.h>
+#endif
 
 // Private constants
+#ifdef PIOS_REALPOSIX
+/*
+ * 1540 bytes was sized for a task that did nothing but vTaskDelay under
+ * external physics. The realposix branch adds a ~96-byte sensor snapshot,
+ * four UAVObject structs and a powf() frame, and then calls UAVObjSet four
+ * times - which takes mutexes and dispatches events, none of it free. Posix
+ * stack frames are also far larger than the ARM ones this number was chosen
+ * against.
+ *
+ * The overflow does NOT crash. It quietly corrupts whatever follows the
+ * stack, and the firmware runs for ~15-20 s before every FreeRTOS task stops
+ * - IDLE included - with the scheduler parked at 0 % CPU. That signature
+ * looked like a scheduling bug for several iterations and is not one.
+ */
+#define STACK_SIZE_BYTES 8192
+#else
 #define STACK_SIZE_BYTES 1540
+#endif
 #define TASK_PRIORITY    (tskIDLE_PRIORITY + 3)
 #define SENSOR_PERIOD    2
 
@@ -181,6 +204,223 @@ static void SensorsTask(__attribute__((unused)) void *parameters)
     uint32_t last_time = PIOS_DELAY_GetRaw();
     while (1) {
         PIOS_WDG_UpdateFlag(PIOS_WDG_SENSORS);
+
+#ifdef PIOS_REALPOSIX
+        /*
+         * REALPOSIX: publish the REAL sensors the hub thread is reading.
+         *
+         * The hub owns a plain pthread (see pios_sensors_hub.c) precisely so
+         * this task never performs a syscall - a blocking ioctl here would
+         * freeze every FreeRTOS task for the duration of the read. All this
+         * does is copy a seqlock-protected snapshot and hand it to the
+         * UAVObjects, which is cheap and cannot block.
+         *
+         * Each object is published ONLY when its counter has moved. The hub
+         * samples at different rates (imu 500 Hz, baro 50, mag 25), and
+         * re-publishing an unchanged value would fake sensor updates - which
+         * matters because stabilizationInnerloopTask is triggered BY
+         * GyroSensor updates, and the estimator gates on MagSensor arriving.
+         */
+        {
+            static uint32_t last_imu, last_baro, last_mag, last_mag2, last_gps, last_imu2;
+            static bool telemetry_throttled = false;
+
+            /*
+             * Throttle sensor-object TELEMETRY before the first publish.
+             *
+             * Locally Set() objects fire telemetry events; UAVTalk-received
+             * ones do not (loop prevention). Under Gazebo the sensor objects
+             * arrive via UAVTalk, so telemetry stays idle - which is why this
+             * never appeared in a year of SITL. Publishing locally at 500 Hz
+             * floods TelTx with ~1100 events/s; TelTx and the UDP tasks all
+             * run at tskIDLE_PRIORITY+7, and once that band never goes
+             * collectively idle, EVERY task at +6 and below starves - the
+             * Sensors task, the estimator callbacks, IDLE included. Measured
+             * on the OSD32MP1: firmware ran 2-20 s then all low-band tasks
+             * froze (voluntary ctxt switches stopped dead) while the +7 band
+             * cycled normally at 456-1000 wakes/s.
+             *
+             * Raw 500 Hz sensor streams do not belong on telemetry anyway;
+             * a GCS wanting them can change the metadata explicitly.
+             */
+            if (!telemetry_throttled) {
+                telemetry_throttled = true;
+                UAVObjMetadata md;
+                UAVObjHandle objs[] = {
+                    GyroSensorHandle(), AccelSensorHandle(),
+                    BaroSensorHandle(), MagSensorHandle(),
+                    AuxMagSensorHandle()
+                };
+                for (unsigned i = 0; i < sizeof(objs) / sizeof(objs[0]); i++) {
+                    UAVObjGetMetadata(objs[i], &md);
+                    UAVObjSetTelemetryUpdateMode(&md, UPDATEMODE_PERIODIC);
+                    md.telemetryUpdatePeriod = 1000;   /* 1 Hz is plenty */
+                    UAVObjSetMetadata(objs[i], &md);
+                }
+            }
+            /* static, not automatic: ~96 bytes, and only this task reads it */
+            static struct pios_sensors_hub_data h;
+
+            if (PIOS_SENSORS_HUB_Get(&h)) {
+                if (h.have_imu && h.imu_count != last_imu) {
+                    last_imu = h.imu_count;
+
+                    AccelSensorData a;
+                    a.x = h.accel_mss[0];
+                    a.y = h.accel_mss[1];
+                    a.z = h.accel_mss[2];
+                    a.temperature = h.imu_temp_c;
+                    AccelSensorSet(&a);
+
+                    /* Published LAST of the pair on purpose: GyroSensor is
+                     * what dispatches the inner loop, so the accel it will
+                     * read is already in place when it runs. */
+                    GyroSensorData g;
+                    g.x = h.gyro_dps[0];
+                    g.y = h.gyro_dps[1];
+                    g.z = h.gyro_dps[2];
+                    g.temperature = h.imu_temp_c;
+                    GyroSensorSet(&g);
+                }
+
+                /*
+                 * IMU failover: the second MPU-9150 rides the CAN bus via
+                 * the L431's compact stream. It is NOT fused with the local
+                 * sensor - same part, no shared clock - it takes over
+                 * publishing only when the local I2C stream has been silent
+                 * for 200 ms (100 lost samples at 500 Hz), and stands down
+                 * the moment the local sensor speaks again. The inner loop
+                 * then keeps closing at the CAN rate instead of dying with
+                 * the I2C bus. Timestamps are both hub CLOCK_MONOTONIC, so
+                 * the comparison needs no clock read here.
+                 */
+                if (h.have_imu2 && h.imu2_count != last_imu2) {
+                    last_imu2 = h.imu2_count;
+                    static bool failed_over = false;
+                    bool local_dead = !h.have_imu
+                                      || (h.imu2_time - h.imu_time) > 0.2;
+                    if (local_dead) {
+                        if (!failed_over) {
+                            failed_over = true;
+                            PIOS_SHMLOG_Printf("[sensors] LOCAL IMU SILENT - failing over to CAN IMU stream");
+                        }
+                        AccelSensorData a2;
+                        a2.x = h.imu2_accel_mss[0];
+                        a2.y = h.imu2_accel_mss[1];
+                        a2.z = h.imu2_accel_mss[2];
+                        a2.temperature = h.imu_temp_c;
+                        AccelSensorSet(&a2);
+
+                        GyroSensorData g2;
+                        g2.x = h.imu2_gyro_dps[0];
+                        g2.y = h.imu2_gyro_dps[1];
+                        g2.z = h.imu2_gyro_dps[2];
+                        g2.temperature = h.imu_temp_c;
+                        GyroSensorSet(&g2);
+                    } else if (failed_over) {
+                        failed_over = false;
+                        PIOS_SHMLOG_Printf("[sensors] local IMU back - CAN IMU stands down");
+                    }
+                }
+
+                if (h.have_baro && h.baro_count != last_baro) {
+                    last_baro = h.baro_count;
+
+                    BaroSensorData b;
+                    b.Temperature = h.baro_temp_c;
+                    b.Pressure    = h.press_pa / 1000.0f;   /* Pa -> kPa */
+                    /* International Standard Atmosphere, the same relation
+                     * pios_ms5611.c uses. 101.325 kPa / 288.15 K sea level. */
+                    b.Altitude    = 44330.0f *
+                                    (1.0f - powf(b.Pressure / 101.325f,
+                                                 (1.0f / 5.255f)));
+                    BaroSensorSet(&b);
+                }
+
+                if (h.have_mag2 && h.mag2_count != last_mag2) {
+                    last_mag2 = h.mag2_count;
+
+                    /*
+                     * The HMC5883L goes to AuxMagSensor, not MagSensor: this
+                     * tree already has auxmagsupport.c to fuse a second
+                     * magnetometer, and MagSensor belongs to the RM3100 -
+                     * which is the better part by ~25x on quantisation
+                     * (12.2 nT vs ~300 nT) and is the one the estimator
+                     * should trust. Two sensors writing one object would
+                     * just be the last writer winning.
+                     *
+                     * Status is GOOD unconditionally because the driver
+                     * already rejects the -4096 saturation flag at the
+                     * source - a reading that reaches here is real.
+                     */
+                    AuxMagSensorData am;
+                    am.x = h.mag2_ga[0] * 1000.0f;          /* Ga -> mGa */
+                    am.y = h.mag2_ga[1] * 1000.0f;
+                    am.z = h.mag2_ga[2] * 1000.0f;
+                    am.Status = AUXMAGSENSOR_STATUS_OK;
+                    AuxMagSensorSet(&am);
+                }
+
+                if (h.gps_count != last_gps) {
+                    last_gps = h.gps_count;
+
+                    /* Truthful no-fix publishing: Status carries the fix
+                     * state, so filterlla's gates ignore the zeros rather
+                     * than fusing them. Fix2 carries only PDOP; HDOP/VDOP
+                     * are set to it rather than invented. */
+                    GPSPositionSensorData gp;
+                    GPSPositionSensorGet(&gp);
+                    gp.Latitude   = h.gps_lat_1e7;
+                    gp.Longitude  = h.gps_lon_1e7;
+                    gp.Altitude   = h.gps_alt_msl_m;
+                    gp.Satellites = (int8_t)h.gps_sats;
+                    gp.PDOP       = h.gps_pdop;
+                    /* real HDOP/VDOP from gnss.Auxiliary when it has
+                     * arrived; PDOP stands in only until then */
+                    gp.HDOP       = (h.gps_aux_count > 0) ? h.gps_hdop : h.gps_pdop;
+                    gp.VDOP       = (h.gps_aux_count > 0) ? h.gps_vdop : h.gps_pdop;
+                    gp.SensorType = GPSPOSITIONSENSOR_SENSORTYPE_UNKNOWN;
+                    gp.Status     = (h.gps_fix == 3) ? GPSPOSITIONSENSOR_STATUS_FIX3D :
+                                    (h.gps_fix == 2) ? GPSPOSITIONSENSOR_STATUS_FIX2D :
+                                    GPSPOSITIONSENSOR_STATUS_NOFIX;
+                    if (h.gps_fix >= 2) {
+                        gp.Groundspeed = sqrtf(h.gps_ned_vel[0] * h.gps_ned_vel[0]
+                                               + h.gps_ned_vel[1] * h.gps_ned_vel[1]);
+                        gp.Heading = atan2f(h.gps_ned_vel[1], h.gps_ned_vel[0])
+                                     * 57.29578f;
+                        if (gp.Heading < 0.0f) {
+                            gp.Heading += 360.0f;
+                        }
+                    } else {
+                        gp.Groundspeed = 0.0f;
+                        gp.Heading     = 0.0f;
+                    }
+                    GPSPositionSensorSet(&gp);
+
+                    if (h.gps_fix == 3) {
+                        GPSVelocitySensorData gv;
+                        gv.North = h.gps_ned_vel[0];
+                        gv.East  = h.gps_ned_vel[1];
+                        gv.Down  = h.gps_ned_vel[2];
+                        GPSVelocitySensorSet(&gv);
+                    }
+                }
+
+                if (h.have_mag && h.mag_count != last_mag) {
+                    last_mag = h.mag_count;
+
+                    MagSensorData m;
+                    m.x = h.mag_ga[0] * 1000.0f;            /* Ga -> mGa */
+                    m.y = h.mag_ga[1] * 1000.0f;
+                    m.z = h.mag_ga[2] * 1000.0f;
+                    m.temperature = h.baro_temp_c;
+                    MagSensorSet(&m);
+                }
+            }
+            vTaskDelay(2 / portTICK_RATE_MS);
+            continue;
+        }
+#endif /* PIOS_REALPOSIX */
 
         if (externalPhysics) {
             vTaskDelay(2 / portTICK_RATE_MS);
